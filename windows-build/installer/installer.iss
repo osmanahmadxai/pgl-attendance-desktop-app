@@ -1,19 +1,20 @@
-; PGL Attendance — Inno Setup installer
-; Builds a single .exe that installs the Node backend (as a Windows service via NSSM),
-; the C# WinForms tray app, and the bundled Node runtime.
+; PGL Attendance — native installer (no Node, no Next.js, no NSSM).
+; Installs:
+;   • PglAttendanceService.exe   (Windows Service, started via sc.exe)
+;   • PglAttendance.exe          (native WinForms desktop UI)
+; Both are .NET 8 self-contained single-file exes (no .NET install needed on target).
 
-#define MyAppName        "PGL Attendance"
-#define MyAppShortName   "PGLAttendance"
-#define MyAppPublisher   "PGL"
-#define MyAppExeName     "PglAttendanceTray.exe"
-#define MyServiceName    "PGLAttendanceSync"
-#define MyServiceDisplay "PGL Attendance Sync"
+#define MyAppName         "PGL Attendance"
+#define MyAppPublisher    "PGL"
+#define MyAppExeName      "PglAttendance.exe"
+#define MyServiceName     "PGLAttendanceSync"
+#define MyServiceDisplay  "PGL Attendance Sync"
+#define MyServiceExe      "PglAttendanceService.exe"
 #ifndef MyAppVersion
-  #define MyAppVersion   "1.0.0"
+  #define MyAppVersion    "1.0.0"
 #endif
 
 #ifndef StagingDir
-  ; Filled in by build.ps1 via /DStagingDir=...
   #define StagingDir "..\dist\staging"
 #endif
 
@@ -34,8 +35,8 @@ WizardStyle=modern
 PrivilegesRequired=admin
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
-UninstallDisplayIcon={app}\tray\{#MyAppExeName}
-SetupIconFile={#StagingDir}\tray\app.ico
+UninstallDisplayIcon={app}\{#MyAppExeName}
+SetupIconFile={#StagingDir}\app.ico
 CloseApplications=force
 RestartApplications=no
 
@@ -44,102 +45,59 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
 Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Additional shortcuts:"
-Name: "autostarttray"; Description: "Launch tray icon at sign-in"; GroupDescription: "Startup:"
+Name: "autostartapp"; Description: "Launch {#MyAppName} at sign-in"; GroupDescription: "Startup:"
 
 [Dirs]
-Name: "{commonappdata}\{#MyAppName}"; Permissions: users-modify
-Name: "{commonappdata}\{#MyAppName}\logs"; Permissions: users-modify
+Name: "{commonappdata}\{#MyAppName}";       Permissions: users-modify
+Name: "{commonappdata}\{#MyAppName}\logs";  Permissions: users-modify
 
 [Files]
-; Bundled Node.js runtime
-Source: "{#StagingDir}\node\*"; DestDir: "{app}\node"; Flags: recursesubdirs createallsubdirs ignoreversion
-
-; NSSM service wrapper
-Source: "{#StagingDir}\nssm\nssm.exe"; DestDir: "{app}\nssm"; Flags: ignoreversion
-
-; Backend (NestJS compiled + node_modules + prisma)
-Source: "{#StagingDir}\app\backend\*"; DestDir: "{app}\app\backend"; Flags: recursesubdirs createallsubdirs ignoreversion
-
-; Frontend static export
-Source: "{#StagingDir}\app\attendance-frontend\out\*"; DestDir: "{app}\app\attendance-frontend\out"; Flags: recursesubdirs createallsubdirs ignoreversion
-
-; Service launcher
-Source: "{#StagingDir}\service\run-service.cmd"; DestDir: "{app}\service"; Flags: ignoreversion
-
-; Tray app (single self-contained .exe)
-Source: "{#StagingDir}\tray\{#MyAppExeName}"; DestDir: "{app}\tray"; Flags: ignoreversion
-Source: "{#StagingDir}\tray\app.ico"; DestDir: "{app}\tray"; Flags: ignoreversion onlyifdoesntexist
-
-; Initial settings.json — only if it doesn't already exist in ProgramData
-Source: "{#StagingDir}\seed\settings.json"; DestDir: "{commonappdata}\{#MyAppName}"; Flags: onlyifdoesntexist uninsneveruninstall
+Source: "{#StagingDir}\{#MyServiceExe}"; DestDir: "{app}";       Flags: ignoreversion
+Source: "{#StagingDir}\{#MyAppExeName}"; DestDir: "{app}";        Flags: ignoreversion
+Source: "{#StagingDir}\app.ico";          DestDir: "{app}";        Flags: ignoreversion onlyifdoesntexist
+Source: "{#StagingDir}\seed\settings.json";  DestDir: "{commonappdata}\{#MyAppName}"; Flags: onlyifdoesntexist uninsneveruninstall
+Source: "{#StagingDir}\seed\attendance.db";  DestDir: "{commonappdata}\{#MyAppName}"; Flags: onlyifdoesntexist uninsneveruninstall
 
 [Icons]
-Name: "{group}\Open {#MyAppName} Dashboard"; Filename: "http://localhost:4001/"
-Name: "{group}\{#MyAppName} Tray"; Filename: "{app}\tray\{#MyAppExeName}"; IconFilename: "{app}\tray\app.ico"
-Name: "{group}\Settings"; Filename: "{app}\tray\{#MyAppExeName}"; IconFilename: "{app}\tray\app.ico"
-Name: "{group}\Uninstall {#MyAppName}"; Filename: "{uninstallexe}"
-Name: "{autodesktop}\{#MyAppName}"; Filename: "http://localhost:4001/"; IconFilename: "{app}\tray\app.ico"; Tasks: desktopicon
+Name: "{group}\{#MyAppName}";              Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\app.ico"
+Name: "{group}\Uninstall {#MyAppName}";    Filename: "{uninstallexe}"
+Name: "{autodesktop}\{#MyAppName}";        Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\app.ico"; Tasks: desktopicon
 
 [Run]
-; --- Install and start the Windows service via NSSM ---
-Filename: "{app}\nssm\nssm.exe"; Parameters: "install ""{#MyServiceName}"" ""{app}\service\run-service.cmd"""; Flags: runhidden waituntilterminated
-Filename: "{app}\nssm\nssm.exe"; Parameters: "set ""{#MyServiceName}"" DisplayName ""{#MyServiceDisplay}"""; Flags: runhidden waituntilterminated
-Filename: "{app}\nssm\nssm.exe"; Parameters: "set ""{#MyServiceName}"" Description ""Receives attendance device data on the configured port and forwards it to HRMIS. Installed by {#MyAppName}."""; Flags: runhidden waituntilterminated
-Filename: "{app}\nssm\nssm.exe"; Parameters: "set ""{#MyServiceName}"" Start SERVICE_AUTO_START"; Flags: runhidden waituntilterminated
-Filename: "{app}\nssm\nssm.exe"; Parameters: "set ""{#MyServiceName}"" AppDirectory ""{app}\service"""; Flags: runhidden waituntilterminated
-Filename: "{app}\nssm\nssm.exe"; Parameters: "set ""{#MyServiceName}"" AppEnvironmentExtra APP_ROOT=""{app}"""; Flags: runhidden waituntilterminated
-Filename: "{app}\nssm\nssm.exe"; Parameters: "set ""{#MyServiceName}"" AppStdout ""{commonappdata}\{#MyAppName}\logs\service.log"""; Flags: runhidden waituntilterminated
-Filename: "{app}\nssm\nssm.exe"; Parameters: "set ""{#MyServiceName}"" AppStderr ""{commonappdata}\{#MyAppName}\logs\service.err.log"""; Flags: runhidden waituntilterminated
-Filename: "{app}\nssm\nssm.exe"; Parameters: "set ""{#MyServiceName}"" AppRotateFiles 1"; Flags: runhidden waituntilterminated
-Filename: "{app}\nssm\nssm.exe"; Parameters: "set ""{#MyServiceName}"" AppRotateOnline 1"; Flags: runhidden waituntilterminated
-Filename: "{app}\nssm\nssm.exe"; Parameters: "set ""{#MyServiceName}"" AppRotateBytes 10485760"; Flags: runhidden waituntilterminated
-Filename: "{app}\nssm\nssm.exe"; Parameters: "set ""{#MyServiceName}"" AppExit Default Restart"; Flags: runhidden waituntilterminated
-Filename: "{app}\nssm\nssm.exe"; Parameters: "set ""{#MyServiceName}"" AppRestartDelay 3000"; Flags: runhidden waituntilterminated
-Filename: "{app}\nssm\nssm.exe"; Parameters: "set ""{#MyServiceName}"" AppThrottle 5000"; Flags: runhidden waituntilterminated
+; --- Stop any previously installed service (upgrades) ---
+Filename: "{sys}\sc.exe"; Parameters: "stop ""{#MyServiceName}"""; Flags: runhidden waituntilterminated; RunOnceId: "StopPrev"
+Filename: "{sys}\sc.exe"; Parameters: "delete ""{#MyServiceName}"""; Flags: runhidden waituntilterminated; RunOnceId: "DeletePrev"
 
-; --- Run the Prisma migrations once on first install (creates schema if DB is new) ---
-Filename: "{cmd}"; Parameters: "/c set ""DATABASE_URL=file:{commonappdata}\{#MyAppName}\attendance.db"" && ""{app}\node\node.exe"" ""{app}\app\backend\node_modules\prisma\build\index.js"" migrate deploy --schema=""{app}\app\backend\prisma\schema.prisma"""; Flags: runhidden waituntilterminated; StatusMsg: "Preparing the database..."
+; --- Register the new service ---
+Filename: "{sys}\sc.exe"; Parameters: "create ""{#MyServiceName}"" binPath= ""\""{app}\{#MyServiceExe}\"""" DisplayName= ""{#MyServiceDisplay}"" start= auto"; Flags: runhidden waituntilterminated
+Filename: "{sys}\sc.exe"; Parameters: "description ""{#MyServiceName}"" ""Receives attendance device data on the configured port and forwards it to HRMIS. Part of {#MyAppName}."""; Flags: runhidden waituntilterminated
+; Restart on failure: 1st = 3s, 2nd = 3s, subsequent = 5s; counter resets after 60s
+Filename: "{sys}\sc.exe"; Parameters: "failure ""{#MyServiceName}"" reset= 60 actions= restart/3000/restart/3000/restart/5000"; Flags: runhidden waituntilterminated
 
-; --- Open firewall on configured port ---
+; --- Firewall: allow inbound on the listening port (default 4001) ---
+Filename: "netsh"; Parameters: "advfirewall firewall delete rule name=""{#MyAppName}"""; Flags: runhidden waituntilterminated; RunOnceId: "RemoveOldFwRule"
 Filename: "netsh"; Parameters: "advfirewall firewall add rule name=""{#MyAppName}"" dir=in action=allow protocol=TCP localport=4001"; Flags: runhidden waituntilterminated
 
 ; --- Start the service ---
-Filename: "{app}\nssm\nssm.exe"; Parameters: "start ""{#MyServiceName}"""; Flags: runhidden waituntilterminated; StatusMsg: "Starting {#MyAppName} service..."
+Filename: "{sys}\sc.exe"; Parameters: "start ""{#MyServiceName}"""; Flags: runhidden waituntilterminated; StatusMsg: "Starting {#MyAppName} service..."
 
-; --- Launch tray + open browser ---
-Filename: "{app}\tray\{#MyAppExeName}"; Description: "Launch tray icon now"; Flags: nowait postinstall skipifsilent
-Filename: "http://localhost:4001/"; Description: "Open the web dashboard"; Flags: nowait shellexec postinstall skipifsilent
+; --- Launch desktop app at the end of install ---
+Filename: "{app}\{#MyAppExeName}"; Description: "Launch {#MyAppName} now"; Flags: nowait postinstall skipifsilent
 
 [UninstallRun]
-Filename: "{app}\nssm\nssm.exe"; Parameters: "stop ""{#MyServiceName}"""; Flags: runhidden waituntilterminated; RunOnceId: "StopService"
-Filename: "{app}\nssm\nssm.exe"; Parameters: "remove ""{#MyServiceName}"" confirm"; Flags: runhidden waituntilterminated; RunOnceId: "RemoveService"
-Filename: "netsh"; Parameters: "advfirewall firewall delete rule name=""{#MyAppName}"""; Flags: runhidden waituntilterminated; RunOnceId: "RemoveFirewallRule"
-Filename: "taskkill"; Parameters: "/f /im {#MyAppExeName}"; Flags: runhidden waituntilterminated; RunOnceId: "KillTray"
+Filename: "{sys}\sc.exe"; Parameters: "stop ""{#MyServiceName}""";   Flags: runhidden waituntilterminated; RunOnceId: "StopSvc"
+Filename: "{sys}\sc.exe"; Parameters: "delete ""{#MyServiceName}"""; Flags: runhidden waituntilterminated; RunOnceId: "DelSvc"
+Filename: "netsh"; Parameters: "advfirewall firewall delete rule name=""{#MyAppName}"""; Flags: runhidden waituntilterminated; RunOnceId: "DelFw"
+Filename: "taskkill"; Parameters: "/f /im {#MyAppExeName}"; Flags: runhidden waituntilterminated; RunOnceId: "KillUi"
 
 [Registry]
-; HKCU autostart for the tray (only if the user ticked the task)
-Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "PGLAttendanceTray"; ValueData: """{app}\tray\{#MyAppExeName}"""; Tasks: autostarttray; Flags: uninsdeletevalue
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "PGLAttendance"; ValueData: """{app}\{#MyAppExeName}"""; Tasks: autostartapp; Flags: uninsdeletevalue
 
 [UninstallDelete]
-Type: filesandordirs; Name: "{app}\app\backend\node_modules\.cache"
-; NOTE: we intentionally do NOT delete {commonappdata}\{#MyAppName} so the SQLite database and settings survive uninstalls.
+; Intentionally leave %PROGRAMDATA%\PGL Attendance\ in place so the DB + settings survive uninstall.
 
 [Code]
 function NeedRestart(): Boolean;
 begin
   Result := False;
-end;
-
-procedure CurStepChanged(CurStep: TSetupStep);
-var
-  ResultCode: Integer;
-begin
-  if CurStep = ssPostInstall then begin
-    // Make sure ProgramData log files have sensible ACLs (NSSM writes as LocalSystem,
-    // but if the user later opens "Open Logs" we want them to be readable).
-    Exec(ExpandConstant('{cmd}'),
-      '/c icacls "' + ExpandConstant('{commonappdata}\{#MyAppName}') +
-      '" /grant *S-1-5-32-545:(OI)(CI)RX /T',
-      '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
-  end;
 end;

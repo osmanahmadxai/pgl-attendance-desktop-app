@@ -1,0 +1,26 @@
+# .NET build output
+[Bb]in/
+[Oo]bj/
+[Pp]ublish/
+
+# Visual Studio / Rider caches
+.vs/
+.idea/
+*.user
+*.suo
+
+# Editor swap / OS
+*.swp
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Local installer build artifacts (build.ps1 outputs)
+windows-build/dist/
+windows-build/vendor/
+
+# NuGet
+project.lock.json
+*.nupkg

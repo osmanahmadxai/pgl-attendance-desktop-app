@@ -1,223 +1,138 @@
-# PGL Attendance — Windows packaging
+# PGL Attendance — Windows packaging (native C# build)
 
-Builds a single `PGL-Attendance-Setup-x.y.z.exe` setup file. Run it once on a
-Windows machine and the installer drops a Windows service plus a native
-WinForms tray app onto the target PC. **Not Electron.**
+Builds a single `PGL-Attendance-Setup-x.y.z.exe`. Run it once on a Windows PC,
+get a native desktop app + a background Windows Service that receives device
+data on the configured port. No Node, no Next.js, no Electron, no NSSM.
 
-## Runtime architecture (post-install)
+## Runtime architecture
 
 ```
-┌───────────────────────────────────────────────────────────────┐
-│                  Windows host (target machine)                │
-│                                                               │
-│   ┌─────────────────────────────┐                             │
-│   │  PGLAttendanceSync          │  <─ Windows service         │
-│   │  (LocalSystem, autostart)   │     wrapped by NSSM         │
-│   │                             │     auto-restarts on crash  │
-│   │  node.exe  dist/src/main.js │                             │
-│   │   ├─ HTTP/Socket.IO :4001   │ <── attendance devices POST │
-│   │   ├─ serves frontend out/   │     /iclock/cdata           │
-│   │   └─ SQLite via Prisma      │                             │
-│   └──────────┬──────────────────┘                             │
-│              │   reads/writes                                 │
-│              ▼                                                │
-│   C:\ProgramData\PGL Attendance\                              │
-│   ├─ settings.json      (HRMIS URL, port — watched live)      │
-│   ├─ attendance.db      (SQLite — survives uninstalls)        │
-│   └─ logs\              (service.log, service.err.log)        │
-│                                                               │
-│   ┌─────────────────────────────┐                             │
-│   │  PglAttendanceTray.exe      │  <─ runs in the user's      │
-│   │  (C# WinForms self-contained) │   session (not a service) │
-│   │  • status polling (/api/health)                            │
-│   │  • Open Web Dashboard       │                             │
-│   │  • Settings dialog          │  ── PUT /api/settings ──┐   │
-│   │  • Restart Service (UAC)    │  ── net stop/start ─────┤   │
-│   │  • Open Logs Folder         │                         │   │
-│   └──────────┬──────────────────┘                         │   │
-│              └───────────────────────────────────────────►│   │
-└───────────────────────────────────────────────────────────────┘
+┌─ Windows host ────────────────────────────────────────────────────────┐
+│                                                                       │
+│   ┌─────────────────────────────────────────────────────────┐         │
+│   │  PGLAttendanceSync           (Windows Service)          │         │
+│   │  • PglAttendanceService.exe (self-contained .NET 8)     │         │
+│   │  • Kestrel HTTP server on the configured port           │         │
+│   │      └─ POST /iclock/cdata     ◄── attendance devices   │         │
+│   │      └─ GET  /attendance, /stats, /unsynced-ids …       │         │
+│   │      └─ GET/PUT /api/settings, GET /api/health          │         │
+│   │      └─ GET /api/events  (SSE for live updates)         │         │
+│   │  • Sync engine (1 s tick, 10 retries, 10 min cooldown)  │         │
+│   │  • Writes SQLite at %PROGRAMDATA%\PGL Attendance\       │         │
+│   │  • Auto-start + auto-restart on crash (sc.exe failure)  │         │
+│   └─────────────────────────────────────────────────────────┘         │
+│                          ▲                                            │
+│                          │  HTTP localhost                            │
+│                          ▼                                            │
+│   ┌─────────────────────────────────────────────────────────┐         │
+│   │  PglAttendance.exe       (native WinForms desktop UI)   │         │
+│   │  • Records grid, stats cards, sync buttons, settings    │         │
+│   │  • Closing the window DOES NOT stop the service         │         │
+│   └─────────────────────────────────────────────────────────┘         │
+│                                                                       │
+└───────────────────────────────────────────────────────────────────────┘
 ```
 
-**Settings can also be changed from the web UI** at `http://localhost:4001/`
-— click the **Settings** button (gear icon) in the top-right corner. The web
-UI talks to the same `/api/settings` endpoint the tray uses.
+## What's preserved from the original NestJS backend
 
-**Why this design**
+Behavior is byte-for-byte identical:
 
-- **Windows service via NSSM** — runs before any user logs in, restarts on
-  crash (`AppExit Default Restart`, 3 s back-off, 5 s throttle). Survives
-  reboots and Windows updates. Closing the tray icon **does not** stop sync —
-  its Exit menu literally says "Exit (service keeps running)".
-- **node.exe bundled** — no Node install needed on the target PC.
-- **Tray is a separate process** — UI bugs can't take down the sync service.
-- **Settings live in `%PROGRAMDATA%\PGL Attendance\settings.json`** — the
-  backend `fs.watch`-es it. Editing HRMIS URL hot-reloads in ~250 ms; editing
-  the port makes the service self-exit and NSSM restarts it on the new port.
-- **SQLite DB in `%PROGRAMDATA%`** — survives uninstall/upgrade.
+- **Device endpoint:** `POST /iclock/cdata` accepts any content type as text;
+  `~DeviceName=` lines return literal `OK` without persisting; other lines
+  get stored, parsed, and queued for sync.
+- **Parser:** tab-separated, first four fields (userId, datetime, status, verifyType).
+- **Real-time events** for new records, sync updates, stats updates. (NestJS used
+  Socket.IO; we use SSE on `/api/events` — same semantics.)
+- **Batch sort:** for batched POSTs, items are sorted as
+  `[others by id asc] + [status=0 by datetime asc] + [status=1 by datetime asc]`.
+- **Sync queue:** 1-second tick, FIFO, one record at a time.
+- **HRMIS POST:** to `{hrmisUrl}/iclock/cdata`, only a literal `"OK"` response
+  counts as success.
+- **Retry:** up to **10 attempts**, then move to failed queue with **10-minute
+  cooldown**, then re-queue with `retryCount` reset to 0.
+- **SQLite schema:** same `RawAttendance` table (`id, rawData, isSynced,
+  createdAt, retryCount, lastError`). The existing `dev.db` is binary-compatible
+  if you ever want to import it.
 
-## Build the installer (inside a Windows machine or VM)
+## Build prerequisites
 
-### One-time setup on the build machine
+Install once on the Windows build machine:
 
-| Tool                  | Where to get it                                              |
-| --------------------- | ------------------------------------------------------------ |
-| **Node.js 20 LTS+**   | <https://nodejs.org/>                                        |
-| **.NET 8 SDK**        | <https://dotnet.microsoft.com/download/dotnet/8.0>           |
-| **Inno Setup 6**      | <https://jrsoftware.org/isdl.php>                            |
-| **Git** *(optional)*  | to clone this repo into the VM                               |
+| Tool          | Where                                                |
+| ------------- | ---------------------------------------------------- |
+| .NET 8 SDK    | <https://dotnet.microsoft.com/download/dotnet/8.0>   |
+| Inno Setup 6  | <https://jrsoftware.org/isdl.php>                    |
 
-Make sure `node`, `npm`, and `dotnet` are on the `PATH`. Inno Setup is detected
-in any of these locations:
+Verify in PowerShell:
+```powershell
+dotnet --list-sdks      # 8.0.x
+where.exe ISCC          # path to ISCC.exe
+```
 
-- `C:\Program Files (x86)\Inno Setup 6\ISCC.exe`
-- `C:\Program Files\Inno Setup 6\ISCC.exe`
-- `%LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe` *(per-user install)*
-
-### Build command
-
-Open PowerShell in the repo root (or any subdirectory under it) and run:
+## Build command
 
 ```powershell
 pwsh -ExecutionPolicy Bypass -File .\windows-build\scripts\build.ps1
+# → windows-build\dist\PGL-Attendance-Setup-1.0.0.exe   (~45–60 MB)
 ```
 
-or with options:
-
+Optional version:
 ```powershell
-.\windows-build\scripts\build.ps1 -Version 1.2.0 -NodeWinVersion 20.18.1 -NssmVersion 2.24
+.\windows-build\scripts\build.ps1 -Version 1.2.0
 ```
 
-Output:
-
-```
-windows-build\dist\PGL-Attendance-Setup-1.0.0.exe     (~80–120 MB)
-```
-
-That single `.exe` is the only file you ship to end users.
+The script:
+1. `dotnet restore` the solution
+2. `dotnet publish` Service exe (self-contained, single-file, win-x64)
+3. `dotnet publish` Desktop exe (self-contained, single-file, win-x64)
+4. Bootstraps an empty SQLite DB with schema applied (via the service exe itself)
+5. Stages all files
+6. Runs `ISCC.exe installer.iss` → final `.exe`
 
 ## What the installer does on the target PC
 
-1. Installs files to `C:\Program Files\PGL Attendance\`:
-   - `node\node.exe`              — bundled Windows Node runtime
-   - `app\backend\`               — compiled NestJS + Prisma engines + prod node_modules
-   - `app\attendance-frontend\out\` — static Next.js export
-   - `nssm\nssm.exe`              — service wrapper
-   - `service\run-service.cmd`    — NSSM entry point
-   - `tray\PglAttendanceTray.exe` + `app.ico`
-2. Creates `C:\ProgramData\PGL Attendance\{settings.json, attendance.db, logs\}`
-   on first install (DB and settings are kept on subsequent upgrades).
-3. Adds a Windows Firewall **inbound** rule for TCP `4001`.
-4. Registers the service `PGLAttendanceSync` (LocalSystem, AutoStart, restart
-   on failure) and starts it.
-5. Optionally adds the tray to HKCU `Run` (user picks the task during install)
-   and launches both the tray and the dashboard.
+1. Drops `PglAttendanceService.exe`, `PglAttendance.exe`, `app.ico` into `C:\Program Files\PGL Attendance\`.
+2. Seeds `C:\ProgramData\PGL Attendance\{settings.json, attendance.db, logs\}` (only on first install).
+3. Registers Windows Service `PGLAttendanceSync` via `sc.exe create`:
+   - `start= auto`
+   - `failure reset= 60 actions= restart/3000/restart/3000/restart/5000`
+4. Opens Windows Firewall inbound TCP **4001**.
+5. `sc.exe start "PGLAttendanceSync"`.
+6. Adds desktop shortcut + optional autostart at sign-in.
+7. Launches `PglAttendance.exe` (desktop UI).
 
-## Day-to-day operation
+After install:
+- Devices POST to `http://<PC_IP>:4001/iclock/cdata`.
+- Dashboard window is the native desktop app — close it any time; service keeps running.
+- Service starts at boot before any user logs in.
 
-- **Open Web Dashboard** → `http://localhost:4001/` from the host, or
-  `http://<PC_IP>:4001/` from any device on the LAN (firewall rule is added).
-- **Devices POST** → `http://<PC_IP>:4001/iclock/cdata` (plain text body).
-- **Change HRMIS URL** → either:
-  - Web UI → **Settings** (gear icon) → save. Hot-reloads.
-  - System tray → **Settings…** → save.
-- **Change port** → same Settings dialog. Service self-exits and NSSM
-  restarts it on the new port; the firewall rule is updated automatically
-  when the change is made from the tray (the web UI's change does not update
-  the firewall — run the tray's Settings to refresh the rule, or do
-  `netsh advfirewall firewall ...` manually).
-- **Logs** → `C:\ProgramData\PGL Attendance\logs\service.log`
-  (rotated at 10 MiB by NSSM) or tray → **Open Logs Folder**.
-- **Manual service ops** → `services.msc` → "PGL Attendance Sync".
+## Settings (changeable any time)
 
-## Updating the app later
+From the desktop UI's **Settings** button you can change:
+- **HRMIS API URL** — hot-reloads, no restart needed.
+- **Listening port** — the service gracefully self-stops; Windows SCM
+  restarts it on the new port (firewall rule is added by the installer for
+  4001; if you change the port, the rule needs updating manually — TODO).
 
-Build a new installer with a higher `-Version` and run it on the target.
-Inno Setup detects the same `AppId` and upgrades in place:
+Settings are stored at `C:\ProgramData\PGL Attendance\settings.json`. The
+service watches this file with `FileSystemWatcher` and applies changes within
+a quarter-second.
 
-1. Service is stopped
-2. Files are replaced
-3. Service is restarted
+## Logs
 
-`settings.json` and `attendance.db` in `%PROGRAMDATA%` are **not** touched.
+`C:\ProgramData\PGL Attendance\logs\service.log` — rolling text log written by
+the service. Also goes to the Windows Event Log under source `PGLAttendanceSync`.
+
+## Upgrades
+
+Higher-version installer detects the same `AppId` and upgrades in place:
+1. Service stopped and unregistered
+2. Files replaced
+3. Service re-registered + started
+4. SQLite DB and `settings.json` left untouched (uninstall doesn't delete them either)
 
 ## Uninstall
 
-The installer adds an entry to *Apps & Features* — uninstall from there.
-The service is stopped + removed, the firewall rule is deleted, the tray
-process is killed, and `%ProgramFiles%\PGL Attendance\` is removed.
-
-`%PROGRAMDATA%\PGL Attendance\` is intentionally **kept** so the DB and
-unsynced records survive uninstall. Delete that folder manually to wipe data.
-
-## Automated builds + one-line install via GitHub Releases
-
-A GitHub Actions workflow in [.github/workflows/build-installer.yml](../.github/workflows/build-installer.yml)
-builds the installer on every tag push and uploads it to a GitHub Release.
-You never have to set up Node / .NET / Inno Setup on a build PC again.
-
-### Cutting a release
-
-```bash
-# From any machine with git access to the repo:
-git tag v1.0.0
-git push origin v1.0.0
-```
-
-GitHub Actions then:
-1. Spins up a `windows-latest` runner
-2. Installs Node 20, .NET 8 SDK, and Inno Setup (via Chocolatey)
-3. Runs `windows-build\scripts\build.ps1 -Version 1.0.0`
-4. Computes SHA-256 of the resulting `.exe`
-5. Creates Release `v1.0.0` with three assets attached:
-   - `PGL-Attendance-Setup-1.0.0.exe`  (versioned filename)
-   - `PGL-Attendance-Setup.exe`         (stable filename — always the newest)
-   - `SHA256SUMS.txt`
-
-Manually trigger a build (no Release) from the **Actions** tab → *Build
-Windows Installer* → *Run workflow*. The .exe is uploaded as a workflow
-artifact you can download.
-
-### Install on any Windows PC — one PowerShell line
-
-Stable URL (always grabs the newest release):
-
-```powershell
-irm https://github.com/ozmanghani/PGL-attendance-mini-app/releases/latest/download/PGL-Attendance-Setup.exe -OutFile $env:TEMP\pgl.exe; & $env:TEMP\pgl.exe
-```
-
-Specific version:
-
-```powershell
-irm https://github.com/ozmanghani/PGL-attendance-mini-app/releases/download/v1.0.0/PGL-Attendance-Setup-1.0.0.exe -OutFile $env:TEMP\pgl.exe; & $env:TEMP\pgl.exe
-```
-
-Silent install (no UI, for unattended provisioning):
-
-```powershell
-irm https://github.com/ozmanghani/PGL-attendance-mini-app/releases/latest/download/PGL-Attendance-Setup.exe -OutFile $env:TEMP\pgl.exe; & $env:TEMP\pgl.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART
-```
-
-> If the repo is **private**, the user's PowerShell call needs a GitHub token —
-> add `-Headers @{Authorization='token ghp_xxx'}` to the `irm` call, or make
-> the *release* assets public (you can keep the repo private and release
-> assets are still individually downloadable with the right URL pattern,
-> but the latest-download redirect requires repo read access).
-
-### Verify the download (optional but recommended)
-
-```powershell
-irm https://github.com/ozmanghani/PGL-attendance-mini-app/releases/latest/download/SHA256SUMS.txt -OutFile $env:TEMP\sums.txt
-$expected = (Get-Content $env:TEMP\sums.txt | Select-String 'PGL-Attendance-Setup.exe').ToString().Split(' ')[0]
-$actual   = (Get-FileHash $env:TEMP\pgl.exe -Algorithm SHA256).Hash.ToLower()
-if ($expected -ne $actual) { throw "SHA256 mismatch" } else { Write-Host "OK" }
-```
-
-## Common gotchas
-
-- **`prisma generate` fetches Windows engines on first run** — needs internet
-  on the build machine.
-- **`dotnet publish` errors about Windows targeting** — install the .NET 8
-  SDK (the **SDK**, not just the runtime). Verify with `dotnet --list-sdks`.
-- **AV flags the unsigned installer/tray** — ship with a code-signing cert.
-  Inno Setup supports `[Setup] SignTool=` (not configured here).
+Standard "Apps & Features" → uninstall. Service is stopped + removed, firewall
+rule deleted, desktop UI killed, `Program Files` folder removed. **The
+`ProgramData` folder is left intact** so the attendance database survives.

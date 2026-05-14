@@ -10,10 +10,7 @@ permissions:
   contents: write # needed by softprops/action-gh-release
 
 env:
-  NODE_VERSION: "20.x"
   DOTNET_VERSION: "8.0.x"
-  NODE_WIN_VERSION: "20.18.1"
-  NSSM_VERSION: "2.24"
 
 jobs:
   build:
@@ -22,11 +19,6 @@ jobs:
     steps:
       - name: Check out code
         uses: actions/checkout@v4
-
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: ${{ env.NODE_VERSION }}
 
       - name: Set up .NET ${{ env.DOTNET_VERSION }} SDK
         uses: actions/setup-dotnet@v4
@@ -41,11 +33,12 @@ jobs:
           if (-not $iscc) { throw "ISCC.exe not found after Inno Setup install" }
           Write-Host "ISCC at: $($iscc.FullName)"
 
-      - name: Cache vendor downloads (node-win + nssm)
+      - name: Cache NuGet packages
         uses: actions/cache@v4
         with:
-          path: windows-build/vendor
-          key: vendor-node${{ env.NODE_WIN_VERSION }}-nssm${{ env.NSSM_VERSION }}
+          path: ~\.nuget\packages
+          key: nuget-${{ runner.os }}-${{ hashFiles('windows-build/native/**/*.csproj') }}
+          restore-keys: nuget-${{ runner.os }}-
 
       - name: Derive version from tag (or commit SHA on manual runs)
         id: ver
@@ -64,10 +57,7 @@ jobs:
       - name: Build installer
         shell: pwsh
         run: |
-          .\windows-build\scripts\build.ps1 `
-            -Version '${{ steps.ver.outputs.version }}' `
-            -NodeWinVersion '${{ env.NODE_WIN_VERSION }}' `
-            -NssmVersion '${{ env.NSSM_VERSION }}'
+          .\windows-build\scripts\build.ps1 -Version '${{ steps.ver.outputs.version }}'
 
       - name: Create stable filename copy (latest)
         shell: pwsh
