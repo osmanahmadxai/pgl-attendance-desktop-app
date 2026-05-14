@@ -65,8 +65,8 @@ Name: "{autodesktop}\{#MyAppName}";        Filename: "{app}\{#MyAppExeName}"; Ic
 
 [Run]
 ; --- Stop any previously installed service (upgrades) ---
-Filename: "{sys}\sc.exe"; Parameters: "stop ""{#MyServiceName}"""; Flags: runhidden waituntilterminated; RunOnceId: "StopPrev"
-Filename: "{sys}\sc.exe"; Parameters: "delete ""{#MyServiceName}"""; Flags: runhidden waituntilterminated; RunOnceId: "DeletePrev"
+Filename: "{sys}\sc.exe"; Parameters: "stop ""{#MyServiceName}"""; Flags: runhidden waituntilterminated
+Filename: "{sys}\sc.exe"; Parameters: "delete ""{#MyServiceName}"""; Flags: runhidden waituntilterminated
 
 ; --- Register the new service ---
 Filename: "{sys}\sc.exe"; Parameters: "create ""{#MyServiceName}"" binPath= ""\""{app}\{#MyServiceExe}\"""" DisplayName= ""{#MyServiceDisplay}"" start= auto"; Flags: runhidden waituntilterminated
@@ -75,7 +75,7 @@ Filename: "{sys}\sc.exe"; Parameters: "description ""{#MyServiceName}"" ""Receiv
 Filename: "{sys}\sc.exe"; Parameters: "failure ""{#MyServiceName}"" reset= 60 actions= restart/3000/restart/3000/restart/5000"; Flags: runhidden waituntilterminated
 
 ; --- Firewall: allow inbound on the listening port (default 4001) ---
-Filename: "netsh"; Parameters: "advfirewall firewall delete rule name=""{#MyAppName}"""; Flags: runhidden waituntilterminated; RunOnceId: "RemoveOldFwRule"
+Filename: "netsh"; Parameters: "advfirewall firewall delete rule name=""{#MyAppName}"""; Flags: runhidden waituntilterminated
 Filename: "netsh"; Parameters: "advfirewall firewall add rule name=""{#MyAppName}"" dir=in action=allow protocol=TCP localport=4001"; Flags: runhidden waituntilterminated
 
 ; --- Start the service ---
