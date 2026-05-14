@@ -324,12 +324,30 @@ public sealed class MainForm : Form
             Panel1 = { BackColor = Bg, Padding = new Padding(32, 4, 8, 12) },
             Panel2 = { BackColor = Bg, Padding = new Padding(8, 4, 32, 12) },
         };
-        split.Panel1MinSize = 520;
-        split.Panel2MinSize = 320;
-        split.HandleCreated += (_, _) =>
+        split.Panel1MinSize = 360;
+        split.Panel2MinSize = 280;
+
+        // Robustly clamp SplitterDistance into the valid range — the WinForms
+        // setter throws ArgumentOutOfRangeException if you go even 1 px outside
+        // [Panel1MinSize, Width - Panel2MinSize - SplitterWidth].
+        void ApplySplit()
         {
-            try { split.SplitterDistance = Math.Max(620, (int)(split.Width * 0.66)); } catch { /* ignore */ }
-        };
+            try
+            {
+                if (split.IsDisposed || !split.IsHandleCreated) return;
+                int width = split.Width;
+                if (width <= 0) return;
+                int min = split.Panel1MinSize;
+                int max = width - split.Panel2MinSize - split.SplitterWidth;
+                if (max < min) return;          // container is too narrow → leave default
+                int desired = (int)(width * 0.62);
+                int clamped = Math.Max(min, Math.Min(max, desired));
+                if (split.SplitterDistance != clamped) split.SplitterDistance = clamped;
+            }
+            catch { /* swallow — never let layout math crash the UI */ }
+        }
+        split.HandleCreated += (_, _) => ApplySplit();
+        split.SizeChanged   += (_, _) => ApplySplit();
 
         BuildGridCard(split.Panel1);
         BuildActivityCard(split.Panel2);
