@@ -97,11 +97,15 @@ public sealed class SyncEngine : IHostedService, IDisposable
             var row = await _repo.InsertAsync(line);
 
             var vm = AttendanceParser.ToVm(row);
-            // NestJS only emits when: !OPLOG && has tab && datetime != '0'
-            if (!line.StartsWith("OPLOG", StringComparison.Ordinal)
-                && line.Contains('\t')
-                && vm.DateTime != "0")
+            // Emit live preview for anything that isn't device-operation-log noise.
+            // The grid/stats no longer require tab-delimited rows, so the SSE
+            // gate shouldn't either — otherwise non-tab test posts land in the
+            // DB but never trigger a live refresh.
+            if (!line.StartsWith("OPLOG", StringComparison.Ordinal))
             {
+                // If the parser couldn't extract a UserId (no tab), surface
+                // the raw line so the activity feed still shows something.
+                if (string.IsNullOrEmpty(vm.UserId)) vm.UserId = line;
                 _realtime.EmitNewRecord(vm);
                 _realtime.EmitStatsUpdate();
             }

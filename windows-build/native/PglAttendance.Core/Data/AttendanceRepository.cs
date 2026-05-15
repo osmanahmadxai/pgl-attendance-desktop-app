@@ -93,7 +93,13 @@ FROM ""RawAttendance"" WHERE ""id"" = last_insert_rowid();";
         if (limit < 1) limit = 10;
         var skip = (page - 1) * limit;
 
-        var where = @"WHERE ""rawData"" NOT LIKE 'OPLOG%' AND ""rawData"" LIKE '%' || char(9) || '%'";
+        // UI filter: only hide operation-log rows. We used to also require a
+        // tab character but that hides any historical rows whose separator
+        // isn't ASCII 0x09 (e.g. older devices/firmware that sent space- or
+        // CRLF-separated fields). The desktop grid is read-only so showing
+        // them is harmless and makes the dashboard actually represent what's
+        // in the DB.
+        var where = @"WHERE ""rawData"" NOT LIKE 'OPLOG%'";
         if (filter == "synced") where += @" AND ""isSynced"" = 1";
         else if (filter == "unsynced") where += @" AND ""isSynced"" = 0";
 
@@ -124,9 +130,14 @@ LIMIT $limit OFFSET $skip;";
         foreach (var row in rows)
         {
             var vm = Sync.AttendanceParser.ToVm(row);
-            // NestJS: also filtered out datetime === '0' and userId.startsWith('OPLOG')
-            if (vm.DateTime == "0") continue;
             if (vm.UserId.StartsWith("OPLOG", StringComparison.Ordinal)) continue;
+            // If the parser couldn't split the row at all (no tab), fall back
+            // to surfacing the raw line in the UserId column so the UI still
+            // shows that data did arrive.
+            if (string.IsNullOrEmpty(vm.UserId) && string.IsNullOrEmpty(vm.DateTime))
+            {
+                vm.UserId = row.RawData;
+            }
             data.Add(vm);
         }
 
@@ -154,7 +165,7 @@ LIMIT $limit OFFSET $skip;";
         {
             await using var c = conn.CreateCommand();
             c.CommandText = @$"SELECT COUNT(*) FROM ""RawAttendance""
-WHERE ""rawData"" NOT LIKE 'OPLOG%' AND ""rawData"" LIKE '%' || char(9) || '%' {extra};";
+WHERE ""rawData"" NOT LIKE 'OPLOG%' {extra};";
             return Convert.ToInt64(await c.ExecuteScalarAsync() ?? 0L);
         }
         var total = await CountAsync("");
@@ -212,7 +223,6 @@ LIMIT $n;";
 SELECT ""id"" FROM ""RawAttendance""
 WHERE ""isSynced"" = 0
   AND ""rawData"" NOT LIKE 'OPLOG%'
-  AND ""rawData"" LIKE '%' || char(9) || '%'
 ORDER BY ""createdAt"" DESC;";
         var ids = new List<long>();
         await using var rdr = await cmd.ExecuteReaderAsync();
@@ -231,7 +241,6 @@ ORDER BY ""createdAt"" DESC;";
 SELECT ""id"", ""rawData"" FROM ""RawAttendance""
 WHERE ""isSynced"" = 0
   AND ""rawData"" NOT LIKE 'OPLOG%'
-  AND ""rawData"" LIKE '%' || char(9) || '%'
 ORDER BY ""id"" ASC;";
         var rows = new List<(long, string)>();
         await using var rdr = await cmd.ExecuteReaderAsync();
