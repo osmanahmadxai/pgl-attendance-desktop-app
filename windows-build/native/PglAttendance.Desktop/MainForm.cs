@@ -62,6 +62,10 @@ public sealed class MainForm : Form
     private int _totalPages = 0;
     private string _filterValue = "all";
     private string _searchValue = "";
+    private readonly System.Windows.Forms.Timer _searchDebounce = new();
+    // Coalesces refreshes triggered by bursts of SSE events (batch ingest,
+    // queue drain) into at most one fetch/re-render per interval.
+    private readonly System.Windows.Forms.Timer _refreshCoalesce = new() { Interval = 400 };
     private List<ParsedAttendanceVm> _rows = new();
 
     // =========================================================================
@@ -87,6 +91,7 @@ public sealed class MainForm : Form
     private readonly TabButton _tabUnsynced = new("Pending");
     private readonly SearchBox _search       = new();
     private readonly Button _btnSyncAll      = new();
+    private readonly Button _btnDeleteAll    = new();
 
     // Body
     private readonly DataGridView _grid = new();
@@ -124,6 +129,11 @@ public sealed class MainForm : Form
         InitTray();
 
         _poll.Tick += async (_, _) => await RefreshSoftAsync();
+        _refreshCoalesce.Tick += async (_, _) =>
+        {
+            _refreshCoalesce.Stop();
+            await RefreshSoftAsync();
+        };
         Load += async (_, _) =>
         {
             await BootstrapAsync();
@@ -143,6 +153,10 @@ public sealed class MainForm : Form
         FormClosed += (_, _) =>
         {
             _poll.Stop();
+            _searchDebounce.Stop();
+            _searchDebounce.Dispose();
+            _refreshCoalesce.Stop();
+            _refreshCoalesce.Dispose();
             try { _sseCts.Cancel(); } catch { /* ignore */ }
             _tray.Visible = false;
             _tray.Dispose();
@@ -297,21 +311,34 @@ public sealed class MainForm : Form
         toolbar.Controls.Add(_tabSynced);
         toolbar.Controls.Add(_tabUnsynced);
 
-        // search
+        // search — global: queries the whole database server-side, debounced
+        // so we don't fire one HTTP request per keystroke.
         _search.Location = new Point(_tabUnsynced.Right + 16, 12);
         _search.Width = 320;
-        _search.Placeholder = "Search by user, status, verify type…";
-        _search.TextChanged += (_, _) => { _searchValue = _search.Text.Trim(); RenderGrid(); };
+        _search.Placeholder = "Search all records (user, date, status…)";
+        _searchDebounce.Interval = 350;
+        _searchDebounce.Tick += async (_, _) =>
+        {
+            _searchDebounce.Stop();
+            _searchValue = _search.Text.Trim();
+            _page = 1;
+            await RefreshSoftAsync();
+        };
+        _search.TextChanged += (_, _) => { _searchDebounce.Stop(); _searchDebounce.Start(); };
         toolbar.Controls.Add(_search);
 
-        // sync all
+        // sync all + delete all
         StylePrimaryButton(_btnSyncAll, "Sync all unsynced", 170);
         _btnSyncAll.Click += async (_, _) => await OnSyncAllAsync();
+        StyleDangerButton(_btnDeleteAll, "Delete all data", 140);
+        _btnDeleteAll.Click += async (_, _) => await OnDeleteAllAsync();
         toolbar.Resize += (_, _) =>
         {
             _btnSyncAll.Location = new Point(toolbar.Width - _btnSyncAll.Width - 32, 12);
+            _btnDeleteAll.Location = new Point(_btnSyncAll.Left - _btnDeleteAll.Width - 8, 12);
         };
         toolbar.Controls.Add(_btnSyncAll);
+        toolbar.Controls.Add(_btnDeleteAll);
 
         // --- Body: Grid (left) + Activity (right) --------------------------
         // TableLayoutPanel — rock-solid, no SplitterDistance throw-on-init.
@@ -613,6 +640,14 @@ public sealed class MainForm : Form
         b.UseVisualStyleBackColor = false;
     }
 
+    private static void StyleDangerButton(Button b, string text, int width)
+    {
+        StyleGhostButton(b, text, width);
+        b.ForeColor = DangerFg;
+        b.Font = FontBodyBold;
+        b.FlatAppearance.MouseOverBackColor = DangerBg;
+    }
+
     // =========================================================================
     // Drawing helpers
     // =========================================================================
@@ -698,7 +733,7 @@ public sealed class MainForm : Form
             _statSynced.Text   = (stats?.Synced ?? 0).ToString("N0");
             _statUnsynced.Text = (stats?.Unsynced ?? 0).ToString("N0");
 
-            var page = await _svc.GetAttendanceAsync(_page, Limit, _filterValue);
+            var page = await _svc.GetAttendanceAsync(_page, Limit, _filterValue, _searchValue);
             _rows = page.Data;
             _totalPages = page.TotalPages;
             RenderGrid();
@@ -723,11 +758,9 @@ public sealed class MainForm : Form
     {
         _grid.SuspendLayout();
         _grid.Rows.Clear();
-        var filtered = _rows.Where(r => string.IsNullOrEmpty(_searchValue)
-                                     || (r.UserId?.Contains(_searchValue, StringComparison.OrdinalIgnoreCase) ?? false)
-                                     || (r.Status?.Contains(_searchValue, StringComparison.OrdinalIgnoreCase) ?? false)
-                                     || (r.VerifyType?.Contains(_searchValue, StringComparison.OrdinalIgnoreCase) ?? false));
-        foreach (var r in filtered)
+        // Search happens server-side against the whole database; rows arrive
+        // already filtered, so render them as-is.
+        foreach (var r in _rows)
         {
             _grid.Rows.Add(
                 r.Id,
@@ -776,7 +809,7 @@ public sealed class MainForm : Form
                 BeginInvoke((Action)(() => AddActivity(ActivityKind.Received,
                     $"Punch from user {u}",
                     "status " + s)));
-                BeginInvoke((Action)(async () => await RefreshSoftAsync()));
+                BeginInvoke((Action)ScheduleRefresh);
             }
             else if (evt == "syncUpdate")
             {
@@ -787,10 +820,18 @@ public sealed class MainForm : Form
                 BeginInvoke((Action)(() => AddActivity(ok ? ActivityKind.Synced : ActivityKind.Failed,
                     ok ? $"Synced record #{id}" : $"Failed to sync record #{id}",
                     ok ? "HRMIS accepted" : "will retry")));
-                BeginInvoke((Action)(async () => await RefreshSoftAsync()));
+                BeginInvoke((Action)ScheduleRefresh);
             }
         }
         catch { /* malformed payload — ignore */ }
+    }
+
+    /// <summary>Runs on the UI thread. Restart-free coalescing: at most one
+    /// refresh per interval no matter how many SSE events arrive.</summary>
+    private void ScheduleRefresh()
+    {
+        if (IsDisposed) return;
+        if (!_refreshCoalesce.Enabled) _refreshCoalesce.Start();
     }
 
     private enum ActivityKind { Received, Synced, Failed, Info }
@@ -936,6 +977,52 @@ public sealed class MainForm : Form
             await RefreshSoftAsync();
         }
         finally { _btnSyncAll.Enabled = true; }
+    }
+
+    private async Task OnDeleteAllAsync()
+    {
+        var stats = await _svc.GetStatsAsync();
+        if (stats is null)
+        {
+            MessageBox.Show(this, "The background service is not reachable.", "Delete all data",
+                MessageBoxButtons.OK, MessageBoxIcon.Error);
+            return;
+        }
+        if (stats.Total == 0)
+        {
+            MessageBox.Show(this, "There are no records to delete.", "Delete all data",
+                MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        var msg = $"This permanently deletes all {stats.Total:N0} attendance records from this computer's local database.\n\n";
+        msg += stats.Unsynced > 0
+            ? $"WARNING: {stats.Unsynced:N0} records are still PENDING and have NOT been synced to HRMIS. Deleting now loses them forever.\n\n"
+            : "All records have already been synced to HRMIS.\n\n";
+        msg += "Delete everything?";
+
+        var res = MessageBox.Show(this, msg, "Delete all local data",
+            MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2);
+        if (res != DialogResult.Yes) return;
+
+        _btnDeleteAll.Enabled = false;
+        try
+        {
+            var deleted = await _svc.DeleteAllAsync();
+            if (deleted is null)
+            {
+                AddActivity(ActivityKind.Failed, "Delete all failed", "service not reachable");
+                MessageBox.Show(this, "Deleting failed — the background service did not respond.", "Delete all data",
+                    MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+            else
+            {
+                AddActivity(ActivityKind.Info, $"Deleted {deleted:N0} records", "local database cleared");
+                _page = 1;
+                await RefreshSoftAsync();
+            }
+        }
+        finally { _btnDeleteAll.Enabled = true; }
     }
 
     private async Task OpenSettingsAsync()

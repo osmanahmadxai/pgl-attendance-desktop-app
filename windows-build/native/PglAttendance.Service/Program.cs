@@ -34,11 +34,14 @@ builder.Host.UseWindowsService(options => options.ServiceName = "PGLAttendanceSy
 
 builder.Logging.ClearProviders();
 builder.Logging.AddConsole();
-builder.Logging.AddEventLog(eventLogSettings =>
+if (OperatingSystem.IsWindows())
 {
-    eventLogSettings.SourceName = "PGLAttendanceSync";
-    eventLogSettings.LogName = "Application";
-});
+    builder.Logging.AddEventLog(eventLogSettings =>
+    {
+        eventLogSettings.SourceName = "PGLAttendanceSync";
+        eventLogSettings.LogName = "Application";
+    });
+}
 // File logging — write to ProgramData\logs so users can read without admin
 builder.Logging.AddProvider(new FileLoggerProvider(Path.Combine(Paths.LogDir, "service.log")));
 
@@ -161,13 +164,14 @@ app.MapPost("/iclock/cdata", async (HttpRequest req, SyncEngine engine) =>
 });
 
 // ---------------------------------------------------------------------------
-// GET /attendance?page=&limit=&filter=
+// GET /attendance?page=&limit=&filter=&search=
+// search matches anywhere in the raw record, across the entire database.
 // ---------------------------------------------------------------------------
 app.MapGet("/attendance", async (
     [FromServices] AttendanceRepository repo,
-    int? page, int? limit, string? filter) =>
+    int? page, int? limit, string? filter, string? search) =>
 {
-    var p = await repo.GetAttendanceAsync(page ?? 1, limit ?? 10, filter ?? "all");
+    var p = await repo.GetAttendanceAsync(page ?? 1, limit ?? 10, filter ?? "all", search);
     return Results.Json(new
     {
         data = p.Data,
@@ -176,15 +180,6 @@ app.MapGet("/attendance", async (
         limit = p.Limit,
         totalPages = p.TotalPages,
     });
-});
-
-// ---------------------------------------------------------------------------
-// GET /unsynced-ids
-// ---------------------------------------------------------------------------
-app.MapGet("/unsynced-ids", async ([FromServices] AttendanceRepository repo) =>
-{
-    var (ids, count) = await repo.GetAllUnsyncedIdsAsync();
-    return Results.Json(new { ids, count });
 });
 
 // ---------------------------------------------------------------------------
@@ -203,6 +198,24 @@ app.MapPost("/sync-all", async ([FromServices] SyncEngine engine) =>
 {
     var r = await engine.SyncAllRecordsAsync();
     return Results.Json(new { success = r.Success, message = r.Message });
+});
+
+// ---------------------------------------------------------------------------
+// DELETE /attendance — wipe the local database (records are already in HRMIS
+// once synced; the desktop UI confirms with the user before calling this).
+// Queue is cleared first so nothing references a deleted row.
+// ---------------------------------------------------------------------------
+app.MapDelete("/attendance", async (
+    [FromServices] SyncEngine engine,
+    [FromServices] AttendanceRepository repo,
+    [FromServices] RealtimeBroadcaster realtime,
+    [FromServices] ILoggerFactory lf) =>
+{
+    engine.ClearQueue();
+    var deleted = await repo.DeleteAllAsync();
+    realtime.EmitStatsUpdate();
+    lf.CreateLogger("Attendance").LogInformation("Deleted all local attendance data ({Count} rows)", deleted);
+    return Results.Json(new { success = true, deleted });
 });
 
 // ---------------------------------------------------------------------------

@@ -14,10 +14,10 @@ data on the configured port. No Node, no Next.js, no Electron, no NSSM.
 │   │  • PglAttendanceService.exe (self-contained .NET 8)     │         │
 │   │  • Kestrel HTTP server on the configured port           │         │
 │   │      └─ POST /iclock/cdata     ◄── attendance devices   │         │
-│   │      └─ GET  /attendance, /stats, /unsynced-ids …       │         │
+│   │      └─ GET  /attendance, /stats, DELETE /attendance …  │         │
 │   │      └─ GET/PUT /api/settings, GET /api/health          │         │
 │   │      └─ GET /api/events  (SSE for live updates)         │         │
-│   │  • Sync engine (1 s tick, 10 retries, 10 min cooldown)  │         │
+│   │  • Sync engine (exactly-once, oldest punch first)       │         │
 │   │  • Writes SQLite at %PROGRAMDATA%\PGL Attendance\       │         │
 │   │  • Auto-start + auto-restart on crash (sc.exe failure)  │         │
 │   └─────────────────────────────────────────────────────────┘         │
@@ -33,26 +33,41 @@ data on the configured port. No Node, no Next.js, no Electron, no NSSM.
 └───────────────────────────────────────────────────────────────────────┘
 ```
 
-## What's preserved from the original NestJS backend
+## Sync engine guarantees
 
-Behavior is byte-for-byte identical:
-
+- **Verbatim payloads:** each record line is stored and POSTed to
+  `{hrmisUrl}/iclock/cdata` exactly as the device sent it — no timezone
+  conversion or rewriting anywhere. Punch timestamps are parsed only to decide
+  send order.
+- **Exactly-once:** identical device re-uploads collapse into one row (UNIQUE
+  index on `rawData`, with a startup migration that dedupes legacy rows), a
+  record id can be queued only once, and `isSynced` is re-checked immediately
+  before every POST. Clicking "Sync all" repeatedly can never double-send.
+- **Oldest first:** the queue is a priority queue keyed by the punch timestamp
+  inside the record, so records always go out in chronological order — HRMIS
+  pairs check-outs against previously received check-ins, so this matters.
+- **Order-preserving retries:** if HRMIS is unreachable (network error /
+  5xx / 408 / 429), the same record retries at the head with exponential
+  backoff (2 s → 5 min) and later records never overtake it. A record HRMIS
+  actively rejects (4xx / non-`OK` body) is marked with `lastError` and
+  skipped so it can't block the queue; a record that keeps drawing server
+  errors is skipped after 10 answered failures. Both stay Pending and can be
+  retried with "Sync all".
+- **Crash-safe:** on service start every unsynced row is re-queued
+  automatically (in the background, so startup is never delayed).
 - **Device endpoint:** `POST /iclock/cdata` accepts any content type as text;
-  `~DeviceName=` lines return literal `OK` without persisting; other lines
-  get stored, parsed, and queued for sync.
-- **Parser:** tab-separated, first four fields (userId, datetime, status, verifyType).
-- **Real-time events** for new records, sync updates, stats updates. (NestJS used
-  Socket.IO; we use SSE on `/api/events` — same semantics.)
-- **Batch sort:** for batched POSTs, items are sorted as
-  `[others by id asc] + [status=0 by datetime asc] + [status=1 by datetime asc]`.
-- **Sync queue:** 1-second tick, FIFO, one record at a time.
-- **HRMIS POST:** to `{hrmisUrl}/iclock/cdata`, only a literal `"OK"` response
-  counts as success.
-- **Retry:** up to **10 attempts**, then move to failed queue with **10-minute
-  cooldown**, then re-queue with `retryCount` reset to 0.
+  `~DeviceName=` lines return literal `OK` without persisting; `OPLOG` rows
+  and records HRMIS wouldn't store are kept local and excluded from sync.
+- **Real-time events** for new records, sync updates, stats updates over SSE
+  on `/api/events`.
+- **Delete all data:** `DELETE /attendance` (desktop button with confirmation)
+  wipes the local SQLite table; ids are never reused.
+- **Global search:** `GET /attendance?search=` matches the entire database —
+  all-digit queries match the user id prefix, anything else is a substring
+  match (dates, times).
 - **SQLite schema:** same `RawAttendance` table (`id, rawData, isSynced,
-  createdAt, retryCount, lastError`). The existing `dev.db` is binary-compatible
-  if you ever want to import it.
+  createdAt, retryCount, lastError`), so an existing database is compatible;
+  duplicates left by older versions are cleaned up on first start.
 
 ## Build prerequisites
 

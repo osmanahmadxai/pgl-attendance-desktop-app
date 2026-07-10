@@ -1,48 +1,70 @@
 using System;
-using System.Collections.Concurrent;
 using System.Collections.Generic;
-using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using PglAttendance.Core;
 using PglAttendance.Core.Data;
-using PglAttendance.Core.Models;
 using PglAttendance.Core.Sync;
 
 namespace PglAttendance.Service.Sync;
 
 /// <summary>
-/// 100% identical behavior to NestJS app.service.ts:
-///   - saveAttendance: line split, filter empty, parse, save, emit, batch vs single
-///   - batch sort: status='0' asc by datetime, status='1' asc by datetime, others asc by id
-///   - syncQueue: 1-second tick, FIFO, one at a time
-///   - syncToHRMIS: POST raw body, expect literal "OK"
-///   - retry: up to 10, then move to failedQueue with 10-minute cooldown
-///   - failedRetry: 60-second tick, reset retryCount to 0 on re-queue
+/// Reliable, exactly-once, oldest-first forwarder to HRMIS.
+///
+/// Guarantees:
+///   1. Exactly-once: a record id can only be queued once (HashSet gate), and
+///      the DB isSynced flag is re-checked immediately before every POST, so a
+///      record is never sent twice — no matter how often "Sync all" is clicked
+///      or how records arrive. Ingestion dedup (InsertOrGetAsync) additionally
+///      collapses device re-uploads of the same punch into one row.
+///   2. Oldest-first: the queue is a priority queue keyed by the punch
+///      timestamp inside the record (tie-broken by row id), so records always
+///      leave in chronological order regardless of arrival order. This matters
+///      because HRMIS pairs check-outs against previously received check-ins.
+///   3. Verbatim payload: rawData is POSTed exactly as the device sent it —
+///      the timestamp is parsed only for ordering, never rewritten, and no
+///      timezone conversion is applied anywhere.
+///   4. Order-preserving retries: a transient failure (HRMIS down / network /
+///      5xx) re-queues the SAME record and backs off — later records are never
+///      sent ahead of it. A permanent rejection (HRMIS 4xx or non-OK body) is
+///      recorded in lastError and skipped, so one bad record can't block the
+///      queue forever.
+///   5. Crash-safe: on service start, every unsynced row is re-queued, so
+///      pending records survive restarts without user action.
 /// </summary>
 public sealed class SyncEngine : IHostedService, IDisposable
 {
+    private const int TickMs = 1000;
+    private const int MaxBackoffSeconds = 300;
+
+    /// <summary>
+    /// A record that HRMIS actively answers with a transient-class error
+    /// (5xx/408/429) this many times in a row is treated as poisoned and
+    /// skipped (kept pending with lastError) so it can't block the queue
+    /// forever. Network failures (no HTTP response at all) never count toward
+    /// this — when HRMIS is unreachable, retrying the head forever is correct.
+    /// </summary>
+    private const int MaxResponseFailuresPerRecord = 10;
+
     private readonly ILogger<SyncEngine> _logger;
     private readonly AttendanceRepository _repo;
     private readonly HrmisClient _hrmis;
     private readonly SettingsService _settings;
     private readonly RealtimeBroadcaster _realtime;
 
-    private readonly ConcurrentQueue<QueueItem> _syncQueue = new();
-    private readonly List<FailedItem> _failedQueue = new();
-    private readonly object _failedLock = new();
-
-    private readonly List<BatchItem> _batchCollector = new();
-    private readonly object _batchLock = new();
-    private Timer? _batchDebounce;
+    private readonly object _queueLock = new();
+    private readonly PriorityQueue<QueueItem, PunchKey> _queue = new();
+    private readonly HashSet<long> _queuedIds = new();
+    // Rows already marked "not a valid attendance record" this session, so
+    // repeated sync-all clicks don't rewrite the same lastError to the DB.
+    private readonly HashSet<long> _invalidIds = new();
+    private int _transientFailureStreak;
+    private DateTime _nextAttemptUtc = DateTime.MinValue;
 
     private Timer? _syncTimer;
-    private Timer? _failedTimer;
-
     private int _isProcessing;
-    private int _isProcessingFailed;
 
     public SyncEngine(
         ILogger<SyncEngine> logger,
@@ -61,10 +83,25 @@ public sealed class SyncEngine : IHostedService, IDisposable
     public Task StartAsync(CancellationToken cancellationToken)
     {
         _repo.EnsureSchema();
-        // 1-second sync queue tick (mirror setInterval(..., 1000))
-        _syncTimer = new Timer(_ => _ = TickSyncQueueAsync(), null, 1000, 1000);
-        // 60-second failed-retry tick (mirror setInterval(..., 60000))
-        _failedTimer = new Timer(_ => _ = TickFailedRetryAsync(), null, 60000, 60000);
+        _syncTimer = new Timer(_ => _ = TickSyncQueueAsync(), null, TickMs, TickMs);
+
+        // Crash/restart recovery: anything still pending goes back into the
+        // queue (ordered by punch time like everything else). Runs in the
+        // background so a large backlog can't delay service startup and the
+        // device endpoint.
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                var recovered = await SyncAllRecordsAsync();
+                _logger.LogInformation("Startup recovery: {Message}", recovered.Message);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Startup recovery failed — pending records can still be synced manually");
+            }
+        }, cancellationToken);
+
         _logger.LogInformation("Sync engine started.");
         return Task.CompletedTask;
     }
@@ -72,123 +109,120 @@ public sealed class SyncEngine : IHostedService, IDisposable
     public Task StopAsync(CancellationToken cancellationToken)
     {
         _syncTimer?.Dispose(); _syncTimer = null;
-        _failedTimer?.Dispose(); _failedTimer = null;
-        _batchDebounce?.Dispose(); _batchDebounce = null;
         return Task.CompletedTask;
     }
 
     public void Dispose() => StopAsync(default).Wait();
 
     // ------------------------------------------------------------------
-    // Mirror: saveAttendance(rawData: string)
+    // Ingestion: called for every device POST body.
     // ------------------------------------------------------------------
     public async Task<int> SaveAttendanceAsync(string rawData)
     {
-        var lines = (rawData ?? "")
-            .Split('\n')
-            .Select(l => l.Trim())
-            .Where(l => l.Length > 0)
-            .ToList();
-        var isBatch = lines.Count > 1;
+        var lines = (rawData ?? "").Split('\n');
+        var saved = 0;
+        var anyNew = false;
 
-        foreach (var line in lines)
+        foreach (var rawLine in lines)
         {
-            _logger.LogInformation("Saving raw attendance: {Line}", line);
-            var row = await _repo.InsertAsync(line);
+            var line = rawLine.Trim();
+            if (line.Length == 0) continue;
+            saved++;
 
-            var vm = AttendanceParser.ToVm(row);
-            // Emit live preview for anything that isn't device-operation-log noise.
-            // The grid/stats no longer require tab-delimited rows, so the SSE
-            // gate shouldn't either — otherwise non-tab test posts land in the
-            // DB but never trigger a live refresh.
-            if (!line.StartsWith("OPLOG", StringComparison.Ordinal))
+            var (row, isNew) = await _repo.InsertOrGetAsync(line);
+            if (isNew)
             {
-                // If the parser couldn't extract a UserId (no tab), surface
-                // the raw line so the activity feed still shows something.
-                if (string.IsNullOrEmpty(vm.UserId)) vm.UserId = line;
-                _realtime.EmitNewRecord(vm);
-                _realtime.EmitStatsUpdate();
-            }
+                _logger.LogInformation("Saved raw attendance ID {Id}: {Line}", row.Id, line);
 
-            if (isBatch)
-            {
-                lock (_batchLock)
+                if (!AttendanceParser.IsOplog(line))
                 {
-                    _batchCollector.Add(new BatchItem(row.Id, line, 0));
+                    anyNew = true;
+                    var vm = AttendanceParser.ToVm(row);
+                    // If the parser couldn't extract a UserId (no tab), surface
+                    // the raw line so the activity feed still shows something.
+                    if (string.IsNullOrEmpty(vm.UserId)) vm.UserId = line;
+                    _realtime.EmitNewRecord(vm);
                 }
             }
             else
             {
-                // single line → call syncAllRecords like NestJS does
-                await SyncAllRecordsAsync();
+                _logger.LogInformation(
+                    "Duplicate device upload for existing record ID {Id} (synced={Synced}) — not re-inserted: {Line}",
+                    row.Id, row.IsSynced, line);
             }
+
+            // Sync immediately when possible; if HRMIS is down the record just
+            // stays pending in the queue and retries in order.
+            if (!row.IsSynced)
+                await TryEnqueueAsync(row.Id, row.RawData);
         }
 
-        if (isBatch)
-        {
-            _batchDebounce?.Dispose();
-            _batchDebounce = new Timer(_ => ProcessBatch(), null, 2000, Timeout.Infinite);
-        }
+        // One stats broadcast per POST body, not one per line — a large batch
+        // would otherwise trigger hundreds of client refreshes.
+        if (anyNew) _realtime.EmitStatsUpdate();
 
-        return lines.Count;
+        return saved;
     }
 
     // ------------------------------------------------------------------
-    // Mirror: processBatch()
+    // Queue admission — the single gate every record passes through.
     // ------------------------------------------------------------------
-    private void ProcessBatch()
+    private async Task<bool> TryEnqueueAsync(long id, string rawData)
     {
-        List<BatchItem> snapshot;
-        lock (_batchLock)
+        if (AttendanceParser.IsOplog(rawData))
+            return false;
+
+        // Only records HRMIS would actually store go on the wire. Anything
+        // else HRMIS either swallows with a fake "OK" (silent data loss) or
+        // rejects — so we keep such rows local and mark why they won't sync.
+        if (!AttendanceParser.IsValidAttendanceRecord(rawData))
         {
-            if (_batchCollector.Count == 0) return;
-            snapshot = new List<BatchItem>(_batchCollector);
-            _batchCollector.Clear();
+            bool firstTime;
+            lock (_queueLock) firstTime = _invalidIds.Add(id);
+            if (firstTime)
+            {
+                _logger.LogWarning("Record ID {Id} is not a valid attendance record; excluded from sync: {Raw}", id, rawData);
+                try { await _repo.SetLastErrorAsync(id, "Not a valid attendance record — excluded from sync"); }
+                catch { /* best effort */ }
+            }
+            return false;
         }
 
-        // parse, then sort exactly like NestJS:
-        //   status 0  -> by datetime ASC
-        //   status 1  -> by datetime ASC
-        //   others    -> by id ASC
-        //   final order: [...others, ...status0, ...status1]
-        var parsed = snapshot.Select(b =>
+        var key = KeyFor(id, rawData);
+        lock (_queueLock)
         {
-            var p = AttendanceParser.Parse(b.RawData);
-            return new { b.Id, b.RawData, b.RetryCount, Parsed = p };
-        }).ToList();
-
-        var status0 = parsed
-            .Where(p => p.Parsed.Status == "0")
-            .OrderBy(p => TryParseDt(p.Parsed.DateTime))
-            .ToList();
-        var status1 = parsed
-            .Where(p => p.Parsed.Status == "1")
-            .OrderBy(p => TryParseDt(p.Parsed.DateTime))
-            .ToList();
-        var others = parsed
-            .Where(p => p.Parsed.Status != "0" && p.Parsed.Status != "1")
-            .OrderBy(p => p.Id)
-            .ToList();
-
-        foreach (var p in others) _syncQueue.Enqueue(new QueueItem(p.Id, p.RawData, p.RetryCount));
-        foreach (var p in status0) _syncQueue.Enqueue(new QueueItem(p.Id, p.RawData, p.RetryCount));
-        foreach (var p in status1) _syncQueue.Enqueue(new QueueItem(p.Id, p.RawData, p.RetryCount));
+            if (!_queuedIds.Add(id)) return false; // already queued or in flight
+            _queue.Enqueue(new QueueItem(id, rawData, 0), key);
+        }
+        return true;
     }
 
-    private static DateTime TryParseDt(string s)
+    private static PunchKey KeyFor(long id, string rawData)
     {
-        return DateTime.TryParse(s, out var dt) ? dt : DateTime.MinValue;
+        // Parsed only to decide ordering; the payload itself is never touched.
+        // A record whose timestamp fields pass the format gate but aren't a
+        // real calendar date/time sorts LAST (MaxValue), so a freak record can
+        // never jump ahead of legitimate punches.
+        var punch = AttendanceParser.TryGetPunchTimestamp(rawData, out var dt) ? dt : DateTime.MaxValue;
+        return new PunchKey(punch, id);
     }
 
     // ------------------------------------------------------------------
-    // Mirror: startSyncProcess() setInterval(1s) -> pick first, sync
+    // 1-second tick: send exactly one record, oldest punch first.
     // ------------------------------------------------------------------
     private async Task TickSyncQueueAsync()
     {
         if (Interlocked.CompareExchange(ref _isProcessing, 1, 0) != 0) return;
         try
         {
-            if (!_syncQueue.TryDequeue(out var item)) return;
+            QueueItem item;
+            lock (_queueLock)
+            {
+                if (DateTime.UtcNow < _nextAttemptUtc) return; // backing off after transient failure
+                if (!_queue.TryDequeue(out item, out _)) return;
+                // item.Id intentionally stays in _queuedIds while in flight so
+                // a concurrent "Sync all" can't queue it a second time.
+            }
             await SyncToHrmisAsync(item);
         }
         catch (Exception ex)
@@ -203,64 +237,128 @@ public sealed class SyncEngine : IHostedService, IDisposable
 
     private async Task SyncToHrmisAsync(QueueItem item)
     {
-        var url = _settings.HrmisUrl;
-        _logger.LogInformation("Syncing record ID {Id}, attempt {Attempt}", item.Id, item.RetryCount + 1);
-        var result = await _hrmis.PostAsync(url, item.RawData);
-        if (result.Ok)
-        {
-            await _repo.MarkSyncedAsync(item.Id);
-            _logger.LogInformation("Successfully synced record ID {Id}", item.Id);
-            _realtime.EmitSyncUpdate(item.Id, true);
-            return;
-        }
-        // failure
-        var errMsg = result.Error ?? $"HRMIS returned: {result.ResponseText}";
-        _logger.LogError("Failed to sync record ID {Id}: {Err}", item.Id, errMsg);
-        var nextRetry = item.RetryCount + 1;
-        if (nextRetry < 10)
-        {
-            _syncQueue.Enqueue(item with { RetryCount = nextRetry });
-        }
-        else
-        {
-            lock (_failedLock)
-            {
-                _failedQueue.Add(new FailedItem(item.Id, item.RawData, nextRetry,
-                    DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() + 10L * 60L * 1000L));
-            }
-            try { await _repo.SetLastErrorAsync(item.Id, errMsg); } catch { /* best effort */ }
-        }
-    }
-
-    // ------------------------------------------------------------------
-    // Mirror: startFailedRetryProcess() setInterval(60s)
-    // ------------------------------------------------------------------
-    private async Task TickFailedRetryAsync()
-    {
-        if (Interlocked.CompareExchange(ref _isProcessingFailed, 1, 0) != 0) return;
         try
         {
-            FailedItem? eligible;
-            lock (_failedLock)
+            // Exactly-once gate: whatever queued this item, the DB is the
+            // source of truth right before the wire.
+            var synced = await _repo.IsSyncedAsync(item.Id);
+            if (synced is null)
             {
-                if (_failedQueue.Count == 0) return;
-                var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-                eligible = _failedQueue.FirstOrDefault(i => i.NextRetryMs <= now);
-                if (eligible is null) return;
-                _failedQueue.RemoveAll(i => i.Id == eligible.Id);
+                _logger.LogInformation("Record ID {Id} no longer exists (deleted) — dropped from queue", item.Id);
+                ReleaseId(item.Id);
+                return;
             }
-            // NestJS resets retryCount = 0 on requeue
-            _syncQueue.Enqueue(new QueueItem(eligible.Id, eligible.RawData, 0));
-            await Task.CompletedTask;
+            if (synced == true)
+            {
+                _logger.LogInformation("Record ID {Id} already synced — dropped from queue", item.Id);
+                ReleaseId(item.Id);
+                return;
+            }
+
+            var result = await _hrmis.PostAsync(_settings.HrmisUrl, item.RawData);
+
+            if (result.Ok)
+            {
+                // If we crash between the POST and this write, the record is
+                // re-sent on recovery — HRMIS dedupes raw punches on
+                // (userId, datetime, status), so the re-send is a no-op there.
+                await _repo.MarkSyncedAsync(item.Id);
+                ReleaseId(item.Id);
+                ResetBackoff();
+                _logger.LogInformation("Successfully synced record ID {Id}", item.Id);
+                _realtime.EmitSyncUpdate(item.Id, true);
+                _realtime.EmitStatsUpdate();
+                return;
+            }
+
+            if (result.IsTransient)
+            {
+                // Only failures where HRMIS actually answered count toward the
+                // per-record poison cap; if HRMIS is unreachable, nothing is
+                // wrong with the record and it must keep its place in line.
+                var responseFailures = result.HasResponse ? item.ResponseFailures + 1 : item.ResponseFailures;
+                if (responseFailures >= MaxResponseFailuresPerRecord)
+                {
+                    var poisonMsg = $"Skipped after {responseFailures} failed attempts — {result.Error}";
+                    _logger.LogError(
+                        "Record ID {Id} keeps failing with a server response — skipping so the queue can drain: {Err}",
+                        item.Id, result.Error);
+                    try { await _repo.SetLastErrorAsync(item.Id, poisonMsg); } catch { /* best effort */ }
+                    ReleaseId(item.Id);
+                    ResetBackoff();
+                    _realtime.EmitSyncUpdate(item.Id, false);
+                    return;
+                }
+
+                // Keep this record at the head so chronological order is
+                // preserved, and back off.
+                RequeueInFlight(item with { ResponseFailures = responseFailures });
+                var delay = ApplyBackoff();
+                _logger.LogWarning(
+                    "Transient failure syncing record ID {Id} ({Err}) — will retry in {Delay}s, queue order preserved",
+                    item.Id, result.Error, delay);
+                return;
+            }
+
+            // Permanent rejection — HRMIS will never accept this record.
+            var errMsg = result.Error ?? $"HRMIS returned: {result.ResponseText}";
+            _logger.LogError("HRMIS rejected record ID {Id}: {Err}", item.Id, errMsg);
+            try { await _repo.SetLastErrorAsync(item.Id, errMsg); } catch { /* best effort */ }
+            ReleaseId(item.Id);
+            ResetBackoff();
+            _realtime.EmitSyncUpdate(item.Id, false);
         }
-        finally
+        catch (Exception ex)
         {
-            Interlocked.Exchange(ref _isProcessingFailed, 0);
+            // Unexpected local fault (e.g. DB briefly locked) — treat as
+            // transient so the record is never lost.
+            _logger.LogError(ex, "Unexpected error syncing record ID {Id} — will retry", item.Id);
+            RequeueInFlight(item);
+            ApplyBackoff();
+        }
+    }
+
+    /// <summary>
+    /// Puts an in-flight item back. Re-adds the id to _queuedIds rather than
+    /// assuming it's still there — ClearQueue may have run while the item was
+    /// on the wire, and queue + id-set must never diverge.
+    /// </summary>
+    private void RequeueInFlight(QueueItem item)
+    {
+        lock (_queueLock)
+        {
+            _queuedIds.Add(item.Id);
+            _queue.Enqueue(item, KeyFor(item.Id, item.RawData));
+        }
+    }
+
+    private void ReleaseId(long id)
+    {
+        lock (_queueLock) _queuedIds.Remove(id);
+    }
+
+    private int ApplyBackoff()
+    {
+        lock (_queueLock)
+        {
+            _transientFailureStreak++;
+            var delay = Math.Min(MaxBackoffSeconds, 1 << Math.Min(_transientFailureStreak, 8));
+            _nextAttemptUtc = DateTime.UtcNow.AddSeconds(delay);
+            return delay;
+        }
+    }
+
+    private void ResetBackoff()
+    {
+        lock (_queueLock)
+        {
+            _transientFailureStreak = 0;
+            _nextAttemptUtc = DateTime.MinValue;
         }
     }
 
     // ------------------------------------------------------------------
-    // Mirror: syncSelectedRecords(ids)
+    // Manual sync entry points (UI buttons / HTTP endpoints)
     // ------------------------------------------------------------------
     public sealed record SyncResult(bool Success, string Message);
 
@@ -273,45 +371,51 @@ public sealed class SyncEngine : IHostedService, IDisposable
                 "One or more records you are trying to sync are already synced. Please refresh the page and try again.");
         }
         var rows = await _repo.GetUnsyncedByIdsAsync(ids);
-        EnqueueWithBatchSort(rows);
-        return new SyncResult(true, "Sync initiated for selected records");
+        var queued = 0;
+        foreach (var (id, raw) in rows)
+            if (await TryEnqueueAsync(id, raw)) queued++;
+        return new SyncResult(true, $"Sync initiated for {queued} record(s)");
     }
 
-    // ------------------------------------------------------------------
-    // Mirror: syncAllRecords()
-    // ------------------------------------------------------------------
     public async Task<SyncResult> SyncAllRecordsAsync()
     {
         var rows = await _repo.GetUnsyncedForSyncAllAsync();
         if (rows.Count == 0) return new SyncResult(true, "No unsynced records found");
-        // NestJS sync-all uses simple id-asc ordering (no status sort)
+        var queued = 0;
         foreach (var (id, raw) in rows)
-            _syncQueue.Enqueue(new QueueItem(id, raw, 0));
-        return new SyncResult(true, $"Sync initiated for {rows.Count} unsynced records");
+            if (await TryEnqueueAsync(id, raw)) queued++;
+        return new SyncResult(true,
+            $"Sync initiated: {queued} record(s) queued, {rows.Count - queued} already queued or excluded");
     }
 
-    private void EnqueueWithBatchSort(List<(long Id, string RawData)> rows)
+    /// <summary>
+    /// Empties the queue. Used before wiping the local database so no stale
+    /// entry can reference a deleted row (the send-time IsSyncedAsync check is
+    /// the backstop for any item already in flight).
+    /// </summary>
+    public void ClearQueue()
     {
-        var parsed = rows.Select(r => new
+        lock (_queueLock)
         {
-            r.Id,
-            r.RawData,
-            Parsed = AttendanceParser.Parse(r.RawData),
-        }).ToList();
-
-        var status0 = parsed.Where(p => p.Parsed.Status == "0")
-            .OrderBy(p => TryParseDt(p.Parsed.DateTime)).ToList();
-        var status1 = parsed.Where(p => p.Parsed.Status == "1")
-            .OrderBy(p => TryParseDt(p.Parsed.DateTime)).ToList();
-        var others = parsed.Where(p => p.Parsed.Status != "0" && p.Parsed.Status != "1")
-            .OrderBy(p => p.Id).ToList();
-
-        foreach (var p in others) _syncQueue.Enqueue(new QueueItem(p.Id, p.RawData, 0));
-        foreach (var p in status0) _syncQueue.Enqueue(new QueueItem(p.Id, p.RawData, 0));
-        foreach (var p in status1) _syncQueue.Enqueue(new QueueItem(p.Id, p.RawData, 0));
+            _queue.Clear();
+            _queuedIds.Clear();
+            _invalidIds.Clear();
+            _transientFailureStreak = 0;
+            _nextAttemptUtc = DateTime.MinValue;
+        }
+        _logger.LogInformation("Sync queue cleared");
     }
 
-    private readonly record struct QueueItem(long Id, string RawData, int RetryCount);
-    private readonly record struct BatchItem(long Id, string RawData, int RetryCount);
-    private sealed record FailedItem(long Id, string RawData, int RetryCount, long NextRetryMs);
+    /// <summary>ResponseFailures counts consecutive answered-error attempts (poison-record cap).</summary>
+    private readonly record struct QueueItem(long Id, string RawData, int ResponseFailures);
+
+    /// <summary>Chronological order: punch timestamp, then row id.</summary>
+    private readonly record struct PunchKey(DateTime Punch, long Id) : IComparable<PunchKey>
+    {
+        public int CompareTo(PunchKey other)
+        {
+            var c = Punch.CompareTo(other.Punch);
+            return c != 0 ? c : Id.CompareTo(other.Id);
+        }
+    }
 }

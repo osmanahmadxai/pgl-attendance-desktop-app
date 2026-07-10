@@ -59,9 +59,11 @@ public sealed class ServiceClient
         public int TotalPages { get; set; }
     }
 
-    public async Task<Page> GetAttendanceAsync(int page, int limit, string filter, CancellationToken ct = default)
+    public async Task<Page> GetAttendanceAsync(int page, int limit, string filter, string search = "", CancellationToken ct = default)
     {
         var url = $"{BaseUrl}/attendance?page={page}&limit={limit}&filter={Uri.EscapeDataString(filter)}";
+        if (!string.IsNullOrWhiteSpace(search))
+            url += $"&search={Uri.EscapeDataString(search)}";
         using var r = await _http.GetAsync(url, ct);
         r.EnsureSuccessStatusCode();
         var json = await r.Content.ReadAsStringAsync(ct);
@@ -115,6 +117,23 @@ public sealed class ServiceClient
             return r.IsSuccessStatusCode;
         }
         catch { return false; }
+    }
+
+    /// <summary>
+    /// Deletes every record in the local database. Returns the number of rows
+    /// removed, or null if the service was unreachable or refused.
+    /// </summary>
+    public async Task<long?> DeleteAllAsync(CancellationToken ct = default)
+    {
+        try
+        {
+            using var r = await _http.DeleteAsync($"{BaseUrl}/attendance", ct);
+            if (!r.IsSuccessStatusCode) return null;
+            var json = await r.Content.ReadAsStringAsync(ct);
+            using var doc = JsonDocument.Parse(json);
+            return doc.RootElement.TryGetProperty("deleted", out var d) && d.TryGetInt64(out var n) ? n : 0;
+        }
+        catch { return null; }
     }
 
     public sealed class CurrentSettings { public string HrmisUrl { get; set; } = ""; public int Port { get; set; } }
