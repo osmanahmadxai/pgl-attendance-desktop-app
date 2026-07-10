@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  DOTNET_VERSION: "8.0.x"
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Set up .NET ${{ env.DOTNET_VERSION }} SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Cache NuGet packages
+        uses: actions/cache@v4
+        with:
+          path: ~\.nuget\packages
+          key: nuget-${{ runner.os }}-${{ hashFiles('windows-build/native/**/*.csproj') }}
+          restore-keys: nuget-${{ runner.os }}-
+
+      - name: Build solution (Release, warnings as errors)
+        shell: pwsh
+        run: |
+          dotnet build windows-build/native/PglAttendance.sln `
+            --configuration Release `
+            -warnaserror `
+            --nologo
+
+      - name: Publish service (smoke check of the packaging path)
+        shell: pwsh
+        run: |
+          dotnet publish windows-build/native/PglAttendance.Service/PglAttendance.Service.csproj `
+            --configuration Release `
+            --runtime win-x64 `
+            --self-contained true `
+            -p:PublishSingleFile=true `
+            --output out/service `
+            --nologo

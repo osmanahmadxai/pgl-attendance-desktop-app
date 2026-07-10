@@ -36,10 +36,16 @@ builder.Logging.ClearProviders();
 builder.Logging.AddConsole();
 if (OperatingSystem.IsWindows())
 {
-    builder.Logging.AddEventLog(eventLogSettings =>
+    AddWindowsEventLog(builder.Logging);
+}
+
+[System.Runtime.Versioning.SupportedOSPlatform("windows")]
+static void AddWindowsEventLog(Microsoft.Extensions.Logging.ILoggingBuilder logging)
+{
+    logging.AddEventLog(new Microsoft.Extensions.Logging.EventLog.EventLogSettings
     {
-        eventLogSettings.SourceName = "PGLAttendanceSync";
-        eventLogSettings.LogName = "Application";
+        SourceName = "PGLAttendanceSync",
+        LogName = "Application",
     });
 }
 // File logging — write to ProgramData\logs so users can read without admin
