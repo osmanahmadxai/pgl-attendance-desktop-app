@@ -11,7 +11,11 @@ public static class AttendanceParser
 
     private const string OplogPrefix = "OPLOG";
 
-    /// <summary>Device operation-log rows — stored locally, never synced.</summary>
+    /// <summary>
+    /// Device operation-log rows. These are rejected at ingestion and never
+    /// stored; this check remains for rows written by older builds, which are
+    /// still hidden from the UI and excluded from sync.
+    /// </summary>
     public static bool IsOplog(string rawData)
         => rawData is not null && rawData.StartsWith(OplogPrefix, StringComparison.Ordinal);
 

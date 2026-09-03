@@ -115,7 +115,8 @@ public sealed class SyncEngine : IHostedService, IDisposable
     public void Dispose() => StopAsync(default).Wait();
 
     // ------------------------------------------------------------------
-    // Ingestion: called for every device POST body.
+    // Ingestion: called for every device POST body. Non-attendance lines are
+    // dropped here, so the database only ever holds attendance records.
     // ------------------------------------------------------------------
     public async Task<int> SaveAttendanceAsync(string rawData)
     {
@@ -127,6 +128,23 @@ public sealed class SyncEngine : IHostedService, IDisposable
         {
             var line = rawLine.Trim();
             if (line.Length == 0) continue;
+
+            // Only real attendance punches are persisted. Devices push far more
+            // than punches to /iclock/cdata: operation logs (OPLOG... — unlocking
+            // the device, opening the menu, admin actions), user/fingerprint
+            // table uploads and assorted status chatter. None of that is
+            // attendance and none of it could ever be forwarded, so it is
+            // acknowledged and dropped instead of filling the database. The gate
+            // is the same one sync uses — exactly as permissive as what HRMIS
+            // accepts — so a record HRMIS would store can never be discarded
+            // here, and the full request body stays in the service log if a
+            // dropped line ever needs inspecting.
+            if (!AttendanceParser.IsValidAttendanceRecord(line))
+            {
+                _logger.LogInformation("Ignored non-attendance device line (not stored): {Line}", line);
+                continue;
+            }
+
             saved++;
 
             var (row, isNew) = await _repo.InsertOrGetAsync(line);
@@ -134,15 +152,12 @@ public sealed class SyncEngine : IHostedService, IDisposable
             {
                 _logger.LogInformation("Saved raw attendance ID {Id}: {Line}", row.Id, line);
 
-                if (!AttendanceParser.IsOplog(line))
-                {
-                    anyNew = true;
-                    var vm = AttendanceParser.ToVm(row);
-                    // If the parser couldn't extract a UserId (no tab), surface
-                    // the raw line so the activity feed still shows something.
-                    if (string.IsNullOrEmpty(vm.UserId)) vm.UserId = line;
-                    _realtime.EmitNewRecord(vm);
-                }
+                anyNew = true;
+                var vm = AttendanceParser.ToVm(row);
+                // If the parser couldn't extract a UserId (no tab), surface
+                // the raw line so the activity feed still shows something.
+                if (string.IsNullOrEmpty(vm.UserId)) vm.UserId = line;
+                _realtime.EmitNewRecord(vm);
             }
             else
             {

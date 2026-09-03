@@ -10,9 +10,11 @@ namespace PglAttendance.Core.Data;
 /// <summary>
 /// SQLite-backed repository against the existing Prisma "RawAttendance" table.
 /// Columns: id, rawData, isSynced, createdAt, retryCount, lastError.
-/// Rows whose rawData starts with 'OPLOG' are device operation logs and are
-/// excluded from listing, stats, and sync. rawData is deduplicated at insert
-/// time (see InsertOrGetAsync) so one physical punch is exactly one row.
+/// Only attendance records are inserted (the service drops device operation
+/// logs and other non-attendance uploads before they reach here); the 'OPLOG'
+/// exclusions below still apply to rows written by older builds. rawData is
+/// deduplicated at insert time (see InsertOrGetAsync) so one physical punch is
+/// exactly one row.
 /// </summary>
 public sealed class AttendanceRepository
 {
