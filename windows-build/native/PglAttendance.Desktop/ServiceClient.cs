@@ -136,7 +136,26 @@ public sealed class ServiceClient
         catch { return null; }
     }
 
-    public sealed class CurrentSettings { public string HrmisUrl { get; set; } = ""; public int Port { get; set; } }
+    public sealed class CurrentSettings
+    {
+        public string HrmisUrl { get; set; } = "";
+        public int Port { get; set; }
+
+        // Browser access
+        public bool RemoteAccessEnabled { get; set; }
+        public int AdminHttpsPort { get; set; } = 4443;
+        public string[] AllowedIps { get; set; } = Array.Empty<string>();
+        public string[] DeviceAllowedIps { get; set; } = Array.Empty<string>();
+
+        // Reported by the service; never a password or hash.
+        public bool AccountConfigured { get; set; }
+        public string Username { get; set; } = "";
+        public bool RemoteAccessActive { get; set; }
+        public string? CertificateError { get; set; }
+        public bool CertificateSelfSigned { get; set; }
+        public string? CertificateFingerprint { get; set; }
+        public int MinPasswordLength { get; set; } = 12;
+    }
 
     public async Task<CurrentSettings?> GetSettingsAsync(CancellationToken ct = default)
     {
@@ -150,16 +169,72 @@ public sealed class ServiceClient
         catch { return null; }
     }
 
+    /// <summary>Result of a settings/credential write: the service's own message on failure.</summary>
+    public sealed record WriteResult(bool Ok, string? Error);
+
     public async Task<bool> UpdateSettingsAsync(string hrmisUrl, int port, CancellationToken ct = default)
+        => (await UpdateSettingsAsync(new { hrmisUrl, port }, ct)).Ok;
+
+    public async Task<WriteResult> UpdateSettingsAsync(
+        string hrmisUrl,
+        int port,
+        bool remoteAccessEnabled,
+        int adminHttpsPort,
+        string[] allowedIps,
+        string[] deviceAllowedIps,
+        CancellationToken ct = default)
+        => await UpdateSettingsAsync(new
+        {
+            hrmisUrl,
+            port,
+            remoteAccessEnabled,
+            adminHttpsPort,
+            allowedIps,
+            deviceAllowedIps,
+        }, ct);
+
+    private async Task<WriteResult> UpdateSettingsAsync(object payload, CancellationToken ct)
     {
         try
         {
-            var payload = JsonSerializer.Serialize(new { hrmisUrl, port });
-            using var c = new StringContent(payload, Encoding.UTF8, "application/json");
+            using var c = new StringContent(JsonSerializer.Serialize(payload, Json), Encoding.UTF8, "application/json");
             using var r = await _http.PutAsync($"{BaseUrl}/api/settings", c, ct);
-            return r.IsSuccessStatusCode;
+            if (r.IsSuccessStatusCode) return new WriteResult(true, null);
+            return new WriteResult(false, await ReadMessageAsync(r, ct));
         }
-        catch { return false; }
+        catch (Exception ex) { return new WriteResult(false, ex.Message); }
+    }
+
+    /// <summary>
+    /// Sets or changes the administrator account used for browser access. The
+    /// service requires the current password once one exists, even over
+    /// loopback, so a local caller cannot silently take the account over.
+    /// </summary>
+    public async Task<WriteResult> ChangePasswordAsync(
+        string username, string currentPassword, string newPassword, CancellationToken ct = default)
+    {
+        try
+        {
+            var payload = JsonSerializer.Serialize(new { username, currentPassword, newPassword }, Json);
+            using var c = new StringContent(payload, Encoding.UTF8, "application/json");
+            using var r = await _http.PostAsync($"{BaseUrl}/api/auth/password", c, ct);
+            if (r.IsSuccessStatusCode) return new WriteResult(true, null);
+            return new WriteResult(false, await ReadMessageAsync(r, ct));
+        }
+        catch (Exception ex) { return new WriteResult(false, ex.Message); }
+    }
+
+    private static async Task<string> ReadMessageAsync(HttpResponseMessage r, CancellationToken ct)
+    {
+        try
+        {
+            var body = await r.Content.ReadAsStringAsync(ct);
+            using var doc = JsonDocument.Parse(body);
+            if (doc.RootElement.TryGetProperty("message", out var m)) return m.GetString() ?? body;
+            if (doc.RootElement.TryGetProperty("error", out var e)) return e.GetString() ?? body;
+            return body;
+        }
+        catch { return $"The service returned {(int)r.StatusCode}."; }
     }
 
     /// <summary>

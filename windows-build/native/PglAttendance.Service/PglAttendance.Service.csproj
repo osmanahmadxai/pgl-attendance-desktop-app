@@ -11,6 +11,16 @@
   <ItemGroup>
     <PackageReference Include="Microsoft.Extensions.Hosting.WindowsServices" Version="8.0.0" />
   </ItemGroup>
+  <!--
+    The browser UI ships inside the assembly, not as loose wwwroot files: the
+    service is published as a single-file executable and the installer stages
+    only that one file, so anything left on disk beside it would never reach an
+    installed machine. See Web/EmbeddedUi.cs.
+  -->
+  <ItemGroup>
+    <Content Remove="wwwroot\**" />
+    <EmbeddedResource Include="wwwroot\**" />
+  </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\PglAttendance.Core\PglAttendance.Core.csproj" />
   </ItemGroup>

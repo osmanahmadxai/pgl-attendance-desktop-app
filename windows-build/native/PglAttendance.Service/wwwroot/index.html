@@ -1,0 +1,206 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PGL Attendance</title>
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+
+<header class="topbar">
+  <span class="app-title">PGL Attendance</span>
+  <div class="topbar-actions">
+    <span class="user-chip" id="userChip"></span>
+    <button class="btn ghost" id="btnSettings">&#9881;&nbsp; Settings</button>
+    <button class="btn ghost" id="btnLogout">Sign out</button>
+  </div>
+</header>
+
+<section class="hero">
+  <div class="status-chip" id="statusChip">
+    <span class="status-dot" id="statusDot"></span>
+    <span id="statusText">Connecting&hellip;</span>
+  </div>
+  <div class="stats">
+    <div class="stat">
+      <div class="stat-num" id="statTotal">0</div>
+      <div class="stat-label">Total records</div>
+    </div>
+    <div class="stat">
+      <div class="stat-num success" id="statSynced">0</div>
+      <div class="stat-label">Synced</div>
+    </div>
+    <div class="stat">
+      <div class="stat-num warn" id="statUnsynced">0</div>
+      <div class="stat-label">Pending</div>
+    </div>
+  </div>
+</section>
+
+<nav class="toolbar">
+  <div class="tabs">
+    <button class="tab is-active" data-filter="all">All records</button>
+    <button class="tab" data-filter="synced">Synced</button>
+    <button class="tab" data-filter="unsynced">Pending</button>
+  </div>
+  <input class="search" id="search" type="search" autocomplete="off"
+         placeholder="Search all records (user, date, status&hellip;)" aria-label="Search all records">
+  <div class="toolbar-actions">
+    <button class="btn danger" id="btnDeleteAll">Delete all data</button>
+    <button class="btn primary" id="btnSyncAll">Sync all unsynced</button>
+  </div>
+</nav>
+
+<main class="body">
+  <section class="card grid-card">
+    <div class="grid-scroll">
+      <table class="grid">
+        <thead>
+          <tr>
+            <th class="col-id">ID</th>
+            <th class="col-user">User</th>
+            <th class="col-time">Time</th>
+            <th class="col-status">Status</th>
+            <th class="col-verify">Verify</th>
+            <th class="col-sync">Sync</th>
+            <th class="col-received">Received</th>
+          </tr>
+        </thead>
+        <tbody id="gridBody"></tbody>
+      </table>
+      <p class="empty" id="gridEmpty">No records yet.</p>
+    </div>
+  </section>
+
+  <section class="card activity-card">
+    <div class="card-head">
+      <div class="card-title">Activity</div>
+      <div class="card-sub">Live events as devices punch in</div>
+    </div>
+    <ul class="activity" id="activityList"></ul>
+    <p class="empty" id="activityEmpty">Waiting for events&hellip;</p>
+  </section>
+</main>
+
+<footer class="footer">
+  <span class="page-label" id="pageLabel">&mdash;</span>
+  <div class="footer-actions">
+    <button class="btn ghost" id="btnPrev">&lsaquo;&nbsp; Previous</button>
+    <button class="btn ghost" id="btnNext">Next&nbsp; &rsaquo;</button>
+  </div>
+</footer>
+
+<!-- ===================== Settings ===================== -->
+<div class="modal-backdrop" id="settingsModal" hidden>
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="settingsTitle">
+    <div class="modal-head">
+      <div class="modal-title" id="settingsTitle">Settings</div>
+      <div class="modal-sub">Configure the device-receive port and HRMIS sync target.</div>
+    </div>
+
+    <div class="modal-body">
+      <div class="field">
+        <label class="field-label" for="setHrmis">HRMIS server URL</label>
+        <input class="input" id="setHrmis" type="url" spellcheck="false" autocomplete="off">
+        <p class="field-hint">Where attendance records are forwarded, e.g. https://people-api.pglsystem.com</p>
+      </div>
+
+      <div class="field">
+        <label class="field-label" for="setPort">Device port</label>
+        <input class="input narrow" id="setPort" type="number" min="1" max="65535">
+        <p class="field-hint">The port the attendance device sends to. Changing it restarts the service.</p>
+      </div>
+
+      <div class="section-rule"></div>
+      <div class="section-title">Browser access</div>
+
+      <label class="check">
+        <input type="checkbox" id="setRemote">
+        <span>Allow access from other devices on the network</span>
+      </label>
+      <p class="field-hint">
+        When off, the app is reachable only on this computer &mdash; the port is not
+        even opened. Requires an administrator account below.
+      </p>
+
+      <div class="field">
+        <label class="field-label" for="setHttpsPort">Browser port (HTTPS)</label>
+        <input class="input narrow" id="setHttpsPort" type="number" min="1" max="65535">
+        <p class="field-hint">Browse to https://&lt;this-pc-ip&gt;:&lt;port&gt;. Must differ from the device port.</p>
+      </div>
+
+      <div class="field">
+        <label class="field-label" for="setAllowedIps">Restrict browser access to these IPs</label>
+        <input class="input" id="setAllowedIps" spellcheck="false" autocomplete="off"
+               placeholder="e.g. 192.168.1.50, 192.168.1.0/24">
+        <p class="field-hint">Comma-separated addresses or ranges. Leave empty to allow any address (a password is still required).</p>
+      </div>
+
+      <div class="field">
+        <label class="field-label" for="setDeviceIps">Restrict the attendance device to these IPs</label>
+        <input class="input" id="setDeviceIps" spellcheck="false" autocomplete="off"
+               placeholder="e.g. 192.168.1.201">
+        <p class="field-hint">
+          Leave empty unless the device has a fixed address &mdash; if its IP changes, a
+          restriction here silently stops attendance collection.
+        </p>
+      </div>
+
+      <div class="section-rule"></div>
+      <div class="section-title">Administrator account</div>
+
+      <div class="field">
+        <label class="field-label" for="setUsername">Username</label>
+        <input class="input" id="setUsername" autocomplete="username" spellcheck="false">
+      </div>
+
+      <div class="field">
+        <label class="field-label" for="setCurrentPassword">Current password</label>
+        <input class="input" id="setCurrentPassword" type="password" autocomplete="current-password">
+        <p class="field-hint" id="currentPasswordHint">Required to change the password.</p>
+      </div>
+
+      <div class="field">
+        <label class="field-label" for="setNewPassword">New password</label>
+        <input class="input" id="setNewPassword" type="password" autocomplete="new-password">
+        <p class="field-hint" id="passwordRule">At least 12 characters.</p>
+      </div>
+
+      <div class="field">
+        <label class="field-label" for="setConfirmPassword">Confirm new password</label>
+        <input class="input" id="setConfirmPassword" type="password" autocomplete="new-password">
+        <p class="field-hint">Changing the password signs out every browser, including this one.</p>
+      </div>
+
+      <p class="warn-banner" id="settingsWarn" hidden></p>
+    </div>
+
+    <div class="modal-foot">
+      <button class="btn ghost" id="btnSettingsCancel">Cancel</button>
+      <button class="btn primary" id="btnSettingsSave">Save changes</button>
+    </div>
+  </div>
+</div>
+
+<!-- ===================== Confirm ===================== -->
+<div class="modal-backdrop" id="confirmModal" hidden>
+  <div class="modal narrow-modal" role="dialog" aria-modal="true" aria-labelledby="confirmTitle">
+    <div class="modal-head">
+      <div class="modal-title" id="confirmTitle">Delete all local data</div>
+    </div>
+    <div class="modal-body">
+      <p class="confirm-text" id="confirmText"></p>
+    </div>
+    <div class="modal-foot">
+      <button class="btn ghost" id="btnConfirmNo">Cancel</button>
+      <button class="btn danger-solid" id="btnConfirmYes">Delete everything</button>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast" hidden></div>
+
+<script src="/app.js"></script>
+</body>
+</html>

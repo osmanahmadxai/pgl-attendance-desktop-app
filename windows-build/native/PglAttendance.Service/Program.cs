@@ -12,8 +12,11 @@ using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using PglAttendance.Core;
 using PglAttendance.Core.Data;
+using PglAttendance.Core.Security;
 using PglAttendance.Core.Sync;
+using PglAttendance.Service.Security;
 using PglAttendance.Service.Sync;
+using PglAttendance.Service.Web;
 
 Paths.EnsureDirs();
 
@@ -51,25 +54,69 @@ static void AddWindowsEventLog(Microsoft.Extensions.Logging.ILoggingBuilder logg
 // File logging — write to ProgramData\logs so users can read without admin
 builder.Logging.AddProvider(new FileLoggerProvider(Path.Combine(Paths.LogDir, "service.log")));
 
+// ---------------------------------------------------------------------------
+// Listener layout — the backbone of both the security and the stability story.
+//
+//   device port (HTTP, always)   : /iclock/* to the network; full API to loopback
+//                                  only, which is how the desktop app keeps
+//                                  working exactly as before with no login.
+//   admin port  (HTTPS, optional): browser UI + API, always authenticated.
+//
+// The admin listener is only created when remote access is switched on AND a
+// certificate could be produced, so when it is off the surface does not exist
+// at the socket level — not merely behind an auth check.
+// ---------------------------------------------------------------------------
+var bootConfig = bootSettings.Get();
+var credentials = new CredentialStore();
+var securityState = new SecurityState(credentials);
+
+System.Security.Cryptography.X509Certificates.X509Certificate2? adminCert = null;
+string? adminCertError = null;
+var adminSelfSigned = false;
+
+if (bootConfig.RemoteAccessEnabled)
+{
+    if (!credentials.IsConfigured)
+    {
+        adminCertError = "no administrator account is set";
+    }
+    else
+    {
+        var certResult = CertificateProvider.Load(
+            string.IsNullOrWhiteSpace(bootConfig.CertificatePath) ? null : bootConfig.CertificatePath,
+            credentials.CertificatePassword);
+        adminCert = certResult.Certificate;
+        adminCertError = certResult.Error;
+        adminSelfSigned = certResult.SelfSigned;
+    }
+}
+
+var remoteActive = bootConfig.RemoteAccessEnabled && adminCert is not null;
+
 builder.WebHost.UseKestrel(opts =>
 {
+    opts.AddServerHeader = false;
     opts.ListenAnyIP(port);
+
+    if (remoteActive)
+    {
+        opts.ListenAnyIP(bootConfig.AdminHttpsPort, lo => lo.UseHttps(adminCert!));
+    }
 });
 
 builder.Services.AddSingleton(bootSettings);
+builder.Services.AddSingleton(credentials);
+builder.Services.AddSingleton(securityState);
 builder.Services.AddSingleton<AttendanceRepository>(_ => new AttendanceRepository());
 builder.Services.AddSingleton<HrmisClient>();
 builder.Services.AddSingleton<RealtimeBroadcaster>();
 builder.Services.AddSingleton<SyncEngine>();
 builder.Services.AddHostedService(sp => sp.GetRequiredService<SyncEngine>());
 
-builder.Services.AddCors(opts =>
-{
-    opts.AddDefaultPolicy(p => p
-        .AllowAnyOrigin()
-        .AllowAnyHeader()
-        .WithMethods("GET", "POST", "PUT", "OPTIONS"));
-});
+// No CORS policy on purpose: the browser UI is served from the same origin as
+// the API, so cross-origin access should simply be impossible. The previous
+// AllowAnyOrigin policy would have let any web page on the network script the
+// API on behalf of a logged-in admin.
 
 var app = builder.Build();
 
@@ -88,7 +135,12 @@ app.Use(async (ctx, next) =>
     }
 });
 
-app.UseCors();
+// Access control runs before everything else, so no endpoint below can be
+// reached without passing through it.
+app.UseAccessControl(bootSettings, securityState);
+
+// Browser UI, embedded in this assembly. Reachable only through the gate above.
+app.UseEmbeddedUi();
 
 // ---------------------------------------------------------------------------
 // Verbose request logger for everything under /iclock/* — captures device
@@ -265,8 +317,33 @@ app.MapGet("/api/health", ([FromServices] SettingsService settings) =>
 // ---------------------------------------------------------------------------
 // GET /api/settings   PUT /api/settings
 // ---------------------------------------------------------------------------
-app.MapGet("/api/settings", ([FromServices] SettingsService settings) => Results.Json(settings.Get()));
-app.MapPut("/api/settings", async ([FromServices] SettingsService settings, [FromBody] UpdateSettingsDto body) =>
+app.MapGet("/api/settings", ([FromServices] SettingsService settings, [FromServices] SecurityState sec) =>
+{
+    var s = settings.Get();
+    return Results.Json(new
+    {
+        hrmisUrl = s.HrmisUrl,
+        port = s.Port,
+        remoteAccessEnabled = s.RemoteAccessEnabled,
+        adminHttpsPort = s.AdminHttpsPort,
+        allowedIps = s.AllowedIps,
+        deviceAllowedIps = s.DeviceAllowedIps,
+        certificatePath = s.CertificatePath,
+        // Never the password or its hash — only whether an account exists.
+        accountConfigured = sec.Credentials.IsConfigured,
+        username = sec.Credentials.Username,
+        remoteAccessActive = remoteActive,
+        certificateError = adminCertError,
+        certificateSelfSigned = adminSelfSigned,
+        certificateFingerprint = adminCert is null ? null : CertificateProvider.Fingerprint(adminCert),
+        minPasswordLength = CredentialStore.MinPasswordLength,
+    });
+});
+
+app.MapPut("/api/settings", async (
+    [FromServices] SettingsService settings,
+    [FromServices] SecurityState sec,
+    [FromBody] UpdateSettingsDto body) =>
 {
     if (body is null) return Results.BadRequest(new { message = "Body required" });
     if (body.HrmisUrl is not null)
@@ -279,18 +356,143 @@ app.MapPut("/api/settings", async ([FromServices] SettingsService settings, [Fro
     }
     if (body.Port is not null && (body.Port < 1 || body.Port > 65535))
         return Results.BadRequest(new { message = "port must be between 1 and 65535" });
+    if (body.AdminHttpsPort is not null && (body.AdminHttpsPort < 1 || body.AdminHttpsPort > 65535))
+        return Results.BadRequest(new { message = "adminHttpsPort must be between 1 and 65535" });
+    if (body.Port is not null && body.AdminHttpsPort is not null && body.Port == body.AdminHttpsPort)
+        return Results.BadRequest(new { message = "the device port and the browser port must be different" });
 
-    var next = settings.Update(body.HrmisUrl, body.Port);
+    foreach (var rule in (body.AllowedIps ?? Array.Empty<string>()).Concat(body.DeviceAllowedIps ?? Array.Empty<string>()))
+    {
+        if (!string.IsNullOrWhiteSpace(rule) && !IpAllowList.IsValidRule(rule))
+            return Results.BadRequest(new { message = $"'{rule}' is not a valid IP address or CIDR range" });
+    }
+
+    // Refusing to open the browser surface without an account is what stops a
+    // toggle from ever exposing an unauthenticated API.
+    if (body.RemoteAccessEnabled == true && !sec.Credentials.IsConfigured)
+        return Results.BadRequest(new { message = "Set an administrator username and password before enabling browser access." });
+
+    if (body.CertificatePassword is not null)
+        sec.Credentials.SetCertificatePassword(body.CertificatePassword);
+
+    var next = settings.Update(new SettingsPatch(
+        HrmisUrl: body.HrmisUrl,
+        Port: body.Port,
+        RemoteAccessEnabled: body.RemoteAccessEnabled,
+        AdminHttpsPort: body.AdminHttpsPort,
+        AllowedIps: body.AllowedIps,
+        DeviceAllowedIps: body.DeviceAllowedIps,
+        CertificatePath: body.CertificatePath));
+
     await Task.CompletedTask;
     return Results.Json(new { ok = true, settings = next });
 });
 
-// Hot-reload + self-exit on port change so Windows SCM restarts on the new port.
+// ---------------------------------------------------------------------------
+// Authentication
+// ---------------------------------------------------------------------------
+app.MapGet("/api/auth/status", (HttpContext ctx, [FromServices] SecurityState sec) =>
+{
+    var token = ctx.Request.Cookies[AccessControl.SessionCookie];
+    var user = sec.Sessions.Validate(token, sec.Credentials.SecurityStamp);
+    return Results.Json(new
+    {
+        configured = sec.Credentials.IsConfigured,
+        authenticated = user is not null,
+        username = user,
+        minPasswordLength = CredentialStore.MinPasswordLength,
+    });
+});
+
+app.MapPost("/api/auth/login", async (
+    HttpContext ctx,
+    [FromServices] SecurityState sec,
+    [FromServices] ILoggerFactory lf,
+    [FromBody] LoginDto body) =>
+{
+    var log = lf.CreateLogger("Security");
+    var ip = ctx.Connection.RemoteIpAddress?.ToString() ?? "unknown";
+    var username = (body?.Username ?? "").Trim();
+
+    // Throttle on the address and the account independently, so neither
+    // spraying one password across accounts nor many passwords from one host
+    // stays viable.
+    var wait = sec.Throttle.RetryAfterAny($"ip:{ip}", $"user:{username}");
+    if (wait is not null)
+    {
+        log.LogWarning("Login for '{User}' from {Ip} blocked — locked out for another {Seconds}s.",
+            username, ip, (int)wait.Value.TotalSeconds);
+        ctx.Response.Headers.RetryAfter = ((int)wait.Value.TotalSeconds).ToString();
+        return Results.Json(new { error = "Too many failed attempts. Try again later." },
+            statusCode: StatusCodes.Status429TooManyRequests);
+    }
+
+    if (body is null || !sec.Credentials.Validate(username, body.Password ?? ""))
+    {
+        sec.Throttle.RecordFailure($"ip:{ip}");
+        sec.Throttle.RecordFailure($"user:{username}");
+        log.LogWarning("Failed login for '{User}' from {Ip}.", username, ip);
+        await Task.Delay(250); // blunt the timing signal on repeated probing
+        return Results.Json(new { error = "Invalid username or password." },
+            statusCode: StatusCodes.Status401Unauthorized);
+    }
+
+    sec.Throttle.RecordSuccess($"ip:{ip}");
+    sec.Throttle.RecordSuccess($"user:{username}");
+    var token = sec.Sessions.Create(sec.Credentials.Username, sec.Credentials.SecurityStamp);
+    AccessControl.SetSessionCookie(ctx, token);
+    log.LogInformation("Successful login for '{User}' from {Ip}.", sec.Credentials.Username, ip);
+    return Results.Json(new { ok = true, username = sec.Credentials.Username });
+});
+
+app.MapPost("/api/auth/logout", (HttpContext ctx, [FromServices] SecurityState sec) =>
+{
+    sec.Sessions.Revoke(ctx.Request.Cookies[AccessControl.SessionCookie]);
+    AccessControl.ClearSessionCookie(ctx);
+    return Results.Json(new { ok = true });
+});
+
+// Change (or first-time set) the administrator account. Reachable from the
+// desktop app over loopback and from an authenticated browser session; both
+// must supply the current password once one exists.
+app.MapPost("/api/auth/password", (
+    HttpContext ctx,
+    [FromServices] SecurityState sec,
+    [FromServices] ILoggerFactory lf,
+    [FromBody] PasswordDto body) =>
+{
+    if (body is null) return Results.BadRequest(new { message = "Body required" });
+
+    var log = lf.CreateLogger("Security");
+    var username = string.IsNullOrWhiteSpace(body.Username) ? sec.Credentials.Username : body.Username;
+
+    var result = sec.Credentials.SetCredentials(username, body.NewPassword, body.CurrentPassword);
+    if (!result.Ok)
+    {
+        log.LogWarning("Rejected credential change from {Ip}: {Reason}",
+            ctx.Connection.RemoteIpAddress, result.Error);
+        return Results.BadRequest(new { message = result.Error });
+    }
+
+    // Every existing session was issued under the old security stamp, so this
+    // logs out every browser everywhere — including an attacker's.
+    sec.Sessions.RevokeAll();
+    AccessControl.ClearSessionCookie(ctx);
+    log.LogInformation("Administrator credentials updated from {Ip}; all sessions revoked.",
+        ctx.Connection.RemoteIpAddress);
+    return Results.Json(new { ok = true, username = sec.Credentials.Username });
+});
+
+// Hot-reload + self-exit when a listener-affecting setting changes, so the
+// Windows SCM restarts the service on the new ports.
 var lifetime = app.Services.GetRequiredService<IHostApplicationLifetime>();
-bootSettings.PortChanged += (next, prev) =>
+bootSettings.ListenerChanged += (next, prev) =>
 {
     var lg = app.Services.GetRequiredService<ILoggerFactory>().CreateLogger("Settings");
-    lg.LogInformation("Port changed {Prev} -> {Next}, shutting down for SCM restart.", prev, next);
+    lg.LogInformation(
+        "Listener settings changed (device {PrevPort}->{NextPort}, browser {PrevRemote}:{PrevHttps}->{NextRemote}:{NextHttps}); restarting.",
+        prev.Port, next.Port, prev.RemoteAccessEnabled, prev.AdminHttpsPort, next.RemoteAccessEnabled, next.AdminHttpsPort);
+    FirewallManager.Reconcile(next, lg);
     _ = Task.Run(async () =>
     {
         await Task.Delay(1500);
@@ -340,12 +542,53 @@ app.MapGet("/api/events", async (HttpContext ctx, RealtimeBroadcaster bus) =>
     finally { bus.Unsubscribe(id); }
 });
 
-app.Logger.LogInformation("PGLAttendanceSync service listening on port {Port}", port);
+// Keep the firewall in step with the configured ports — the installer can only
+// ever open the port it knew about at install time.
+FirewallManager.Reconcile(bootConfig, app.Logger);
+
+app.Logger.LogInformation("PGLAttendanceSync service listening on port {Port} (device); {Assets} UI assets embedded", port, EmbeddedUi.Count);
+if (remoteActive)
+{
+    app.Logger.LogInformation(
+        "Browser access enabled on https://<this-pc>:{Port} ({Kind} certificate, SHA-256 {Fingerprint})",
+        bootConfig.AdminHttpsPort,
+        adminSelfSigned ? "self-signed" : "supplied",
+        CertificateProvider.Fingerprint(adminCert!));
+    var allow = bootConfig.AllowedIps.Length == 0 ? "any address" : string.Join(", ", bootConfig.AllowedIps);
+    app.Logger.LogInformation("Browser access allow-list: {Allow}", allow);
+}
+else if (bootConfig.RemoteAccessEnabled)
+{
+    // Remote access was requested but could not be brought up. The device
+    // listener is unaffected — attendance collection must never depend on the
+    // admin surface starting successfully.
+    app.Logger.LogError(
+        "Browser access is enabled in settings but could NOT start: {Reason}. Attendance collection is unaffected.",
+        adminCertError ?? "unknown error");
+}
+else
+{
+    app.Logger.LogInformation("Browser access is disabled; the API is reachable only from this computer.");
+}
+
 app.Run();
 
 // ---------------------------------------------------------------------------
 public sealed record SyncIdsDto(long[]? Ids);
-public sealed record UpdateSettingsDto(string? HrmisUrl, int? Port);
+
+public sealed record UpdateSettingsDto(
+    string? HrmisUrl,
+    int? Port,
+    bool? RemoteAccessEnabled,
+    int? AdminHttpsPort,
+    string[]? AllowedIps,
+    string[]? DeviceAllowedIps,
+    string? CertificatePath,
+    string? CertificatePassword);
+
+public sealed record LoginDto(string? Username, string? Password);
+
+public sealed record PasswordDto(string? Username, string? CurrentPassword, string? NewPassword);
 
 // ---------------------------------------------------------------------------
 // Tiny rolling-friendly file logger so the service writes to ProgramData\logs.

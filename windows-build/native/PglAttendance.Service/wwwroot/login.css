@@ -1,0 +1,117 @@
+/* Same palette as app.css / MainForm.cs. */
+:root {
+  --bg:           #f8f9fb;
+  --surface:      #ffffff;
+  --border-hair:  #e7e9ed;
+  --border-soft:  #d8dce2;
+  --text-primary: #1f2328;
+  --text-muted:   #656d76;
+  --text-subtle:  #8b949e;
+  --accent:       #0969da;
+  --accent-hover: #0857b8;
+  --danger-fg:    #cf222e;
+  --danger-bg:    #ffebe9;
+  --font: "Segoe UI", -apple-system, BlinkMacSystemFont, Roboto, Helvetica, Arial, sans-serif;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: var(--bg);
+  color: var(--text-primary);
+  font-family: var(--font);
+  font-size: 13px;
+  -webkit-font-smoothing: antialiased;
+}
+
+.login-card {
+  width: 380px;
+  max-width: 100%;
+  padding: 32px;
+  background: var(--surface);
+  border: 1px solid var(--border-hair);
+  border-radius: 8px;
+  box-shadow: 0 6px 24px rgba(31, 35, 40, 0.06);
+}
+
+.brand {
+  font-size: 20px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+.brand-sub {
+  margin: 6px 0 26px;
+  color: var(--text-muted);
+  font-size: 12.5px;
+}
+
+.field { margin-bottom: 16px; }
+
+.field-label {
+  display: block;
+  margin-bottom: 5px;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.input {
+  width: 100%;
+  height: 36px;
+  padding: 0 10px;
+  border: 1px solid var(--border-soft);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--text-primary);
+  font-family: inherit;
+  font-size: 13px;
+}
+
+.input:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px rgba(9, 105, 218, 0.12);
+}
+
+.btn {
+  width: 100%;
+  height: 38px;
+  margin-top: 4px;
+  border-radius: 6px;
+  border: 1px solid var(--accent);
+  background: var(--accent);
+  color: #fff;
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.btn:hover:not(:disabled) { background: var(--accent-hover); border-color: var(--accent-hover); }
+.btn:disabled { opacity: 0.55; cursor: default; }
+
+.error {
+  margin: 0 0 14px;
+  padding: 10px 12px;
+  border-radius: 6px;
+  background: var(--danger-bg);
+  color: var(--danger-fg);
+  font-size: 12.5px;
+  line-height: 1.45;
+}
+
+.error[hidden] { display: none; }
+
+.foot-note {
+  margin: 22px 0 0;
+  color: var(--text-subtle);
+  font-size: 11.5px;
+  line-height: 1.5;
+  text-align: center;
+}

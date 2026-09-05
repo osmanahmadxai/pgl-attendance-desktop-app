@@ -74,9 +74,14 @@ Filename: "{sys}\sc.exe"; Parameters: "description ""{#MyServiceName}"" ""Receiv
 ; Restart on failure: 1st = 3s, 2nd = 3s, subsequent = 5s; counter resets after 60s
 Filename: "{sys}\sc.exe"; Parameters: "failure ""{#MyServiceName}"" reset= 60 actions= restart/3000/restart/3000/restart/5000"; Flags: runhidden waituntilterminated
 
-; --- Firewall: allow inbound on the listening port (default 4001) ---
+; --- Firewall: open the default device port so a fresh install works at once.
+; From here on the service reconciles these rules itself on every start and
+; whenever the ports change, so changing the port in Settings no longer leaves
+; the firewall pointing at the old one. Rule names must match
+; PglAttendance.Service\Security\FirewallManager.cs.
 Filename: "netsh"; Parameters: "advfirewall firewall delete rule name=""{#MyAppName}"""; Flags: runhidden waituntilterminated
-Filename: "netsh"; Parameters: "advfirewall firewall add rule name=""{#MyAppName}"" dir=in action=allow protocol=TCP localport=4001"; Flags: runhidden waituntilterminated
+Filename: "netsh"; Parameters: "advfirewall firewall delete rule name=""{#MyAppName} (device)"""; Flags: runhidden waituntilterminated
+Filename: "netsh"; Parameters: "advfirewall firewall add rule name=""{#MyAppName} (device)"" dir=in action=allow protocol=TCP localport=4001"; Flags: runhidden waituntilterminated
 
 ; --- Start the service ---
 Filename: "{sys}\sc.exe"; Parameters: "start ""{#MyServiceName}"""; Flags: runhidden waituntilterminated; StatusMsg: "Starting {#MyAppName} service..."
@@ -88,6 +93,8 @@ Filename: "{app}\{#MyAppExeName}"; Description: "Launch {#MyAppName} now"; Flags
 Filename: "{sys}\sc.exe"; Parameters: "stop ""{#MyServiceName}""";   Flags: runhidden waituntilterminated; RunOnceId: "StopSvc"
 Filename: "{sys}\sc.exe"; Parameters: "delete ""{#MyServiceName}"""; Flags: runhidden waituntilterminated; RunOnceId: "DelSvc"
 Filename: "netsh"; Parameters: "advfirewall firewall delete rule name=""{#MyAppName}"""; Flags: runhidden waituntilterminated; RunOnceId: "DelFw"
+Filename: "netsh"; Parameters: "advfirewall firewall delete rule name=""{#MyAppName} (device)"""; Flags: runhidden waituntilterminated; RunOnceId: "DelFwDevice"
+Filename: "netsh"; Parameters: "advfirewall firewall delete rule name=""{#MyAppName} (admin)"""; Flags: runhidden waituntilterminated; RunOnceId: "DelFwAdmin"
 Filename: "taskkill"; Parameters: "/f /im {#MyAppExeName}"; Flags: runhidden waituntilterminated; RunOnceId: "KillUi"
 
 [Registry]

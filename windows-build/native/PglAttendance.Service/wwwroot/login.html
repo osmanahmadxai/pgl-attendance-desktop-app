@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sign in &middot; PGL Attendance</title>
+<link rel="stylesheet" href="/login.css">
+</head>
+<body>
+  <main class="login-card">
+    <div class="brand">PGL Attendance</div>
+    <p class="brand-sub">Sign in to view and manage attendance records.</p>
+
+    <form id="loginForm" autocomplete="on">
+      <div class="field">
+        <label class="field-label" for="username">Username</label>
+        <input class="input" id="username" name="username" autocomplete="username"
+               spellcheck="false" required autofocus>
+      </div>
+
+      <div class="field">
+        <label class="field-label" for="password">Password</label>
+        <input class="input" id="password" name="password" type="password"
+               autocomplete="current-password" required>
+      </div>
+
+      <p class="error" id="error" hidden></p>
+
+      <button class="btn primary" id="btnSubmit" type="submit">Sign in</button>
+    </form>
+
+    <p class="foot-note">
+      This page is served by the PGL Attendance service running on the office PC.
+    </p>
+  </main>
+
+  <script src="/login.js"></script>
+</body>
+</html>

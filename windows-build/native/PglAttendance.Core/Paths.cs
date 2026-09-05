@@ -21,6 +21,16 @@ public static class Paths
     public static string DatabaseFile => Path.Combine(DataDir, "attendance.db");
     public static string LogDir => Path.Combine(DataDir, "logs");
 
+    /// <summary>
+    /// Admin username + password hash. Kept out of settings.json because the
+    /// desktop app reads/writes settings freely, while credentials are only
+    /// ever written by the service process.
+    /// </summary>
+    public static string CredentialsFile => Path.Combine(DataDir, "credentials.json");
+
+    /// <summary>Self-signed TLS certificate for the browser listener.</summary>
+    public static string CertificateFile => Path.Combine(DataDir, "admin-tls.pfx");
+
     public static string SqliteConnectionString
     {
         get

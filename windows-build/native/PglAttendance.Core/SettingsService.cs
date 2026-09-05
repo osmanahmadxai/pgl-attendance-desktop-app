@@ -1,13 +1,29 @@
 using System;
 using System.IO;
+using System.Linq;
 using System.Text.Json;
 
 namespace PglAttendance.Core;
 
 /// <summary>
-/// File-backed settings store mirroring NestJS SettingsService:
-/// loads JSON from %PROGRAMDATA%\PGL Attendance\settings.json,
-/// watches the file for changes, fires events on change.
+/// Patch for <see cref="SettingsService.Update"/> — every field is optional, and
+/// null means "leave unchanged". Using a patch rather than a whole
+/// <see cref="AppSettings"/> stops a caller that only knows about some fields
+/// from silently resetting the others.
+/// </summary>
+public sealed record SettingsPatch(
+    string? HrmisUrl = null,
+    int? Port = null,
+    bool? RemoteAccessEnabled = null,
+    int? AdminHttpsPort = null,
+    string[]? AllowedIps = null,
+    string[]? DeviceAllowedIps = null,
+    string? CertificatePath = null);
+
+/// <summary>
+/// File-backed settings store: loads JSON from
+/// %PROGRAMDATA%\PGL Attendance\settings.json, watches the file for changes,
+/// and fires events on change.
 /// </summary>
 public sealed class SettingsService : IDisposable
 {
@@ -22,7 +38,13 @@ public sealed class SettingsService : IDisposable
     private AppSettings _current;
 
     public event Action<AppSettings, AppSettings>? Changed;
-    public event Action<int, int>? PortChanged;
+
+    /// <summary>
+    /// Raised when a change requires Kestrel to rebind — the device port, the
+    /// HTTPS port, or the remote-access switch. Listeners are fixed at startup,
+    /// so the service restarts itself to apply these.
+    /// </summary>
+    public event Action<AppSettings, AppSettings>? ListenerChanged;
 
     public SettingsService()
     {
@@ -47,7 +69,21 @@ public sealed class SettingsService : IDisposable
         get { lock (_lock) return _current.Port; }
     }
 
+    public int AdminHttpsPort
+    {
+        get { lock (_lock) return _current.AdminHttpsPort; }
+    }
+
+    public bool RemoteAccessEnabled
+    {
+        get { lock (_lock) return _current.RemoteAccessEnabled; }
+    }
+
+    /// <summary>Backwards-compatible overload for the original two-field update.</summary>
     public AppSettings Update(string? hrmisUrl, int? port)
+        => Update(new SettingsPatch(HrmisUrl: hrmisUrl, Port: port));
+
+    public AppSettings Update(SettingsPatch patch)
     {
         AppSettings prev;
         AppSettings next;
@@ -55,15 +91,31 @@ public sealed class SettingsService : IDisposable
         {
             prev = _current.Clone();
             next = prev.Clone();
-            if (!string.IsNullOrWhiteSpace(hrmisUrl))
-                next.HrmisUrl = hrmisUrl.Trim().TrimEnd('/');
-            if (port.HasValue && port.Value > 0 && port.Value < 65536)
-                next.Port = port.Value;
+
+            if (!string.IsNullOrWhiteSpace(patch.HrmisUrl))
+                next.HrmisUrl = patch.HrmisUrl.Trim().TrimEnd('/');
+            if (patch.Port is int p && p > 0 && p < 65536)
+                next.Port = p;
+            if (patch.RemoteAccessEnabled is bool remote)
+                next.RemoteAccessEnabled = remote;
+            if (patch.AdminHttpsPort is int ap && ap > 0 && ap < 65536)
+                next.AdminHttpsPort = ap;
+            if (patch.AllowedIps is not null)
+                next.AllowedIps = Clean(patch.AllowedIps);
+            if (patch.DeviceAllowedIps is not null)
+                next.DeviceAllowedIps = Clean(patch.DeviceAllowedIps);
+            if (patch.CertificatePath is not null)
+                next.CertificatePath = patch.CertificatePath.Trim();
+
+            // The two ports must differ, otherwise Kestrel fails to bind and the
+            // device listener would go down with the admin one.
+            if (next.AdminHttpsPort == next.Port)
+                next.AdminHttpsPort = prev.AdminHttpsPort == prev.Port ? next.Port + 1 : prev.AdminHttpsPort;
 
             WriteToDisk(next);
             _current = next;
         }
-        FireChanged(prev, next, "api");
+        FireChanged(prev, next);
         return next.Clone();
     }
 
@@ -102,20 +154,36 @@ public sealed class SettingsService : IDisposable
             if (Equals(prev, next)) return;
             _current = next;
         }
-        FireChanged(prev, next, "disk");
+        FireChanged(prev, next);
     }
 
-    private void FireChanged(AppSettings prev, AppSettings next, string source)
+    private void FireChanged(AppSettings prev, AppSettings next)
     {
         try { Changed?.Invoke(next, prev); } catch { /* ignore */ }
-        if (prev.Port != next.Port)
+
+        var rebind = prev.Port != next.Port
+                     || prev.AdminHttpsPort != next.AdminHttpsPort
+                     || prev.RemoteAccessEnabled != next.RemoteAccessEnabled;
+        if (rebind)
         {
-            try { PortChanged?.Invoke(next.Port, prev.Port); } catch { /* ignore */ }
+            try { ListenerChanged?.Invoke(next, prev); } catch { /* ignore */ }
         }
     }
 
+    private static string[] Clean(string[] values)
+        => values.Select(v => (v ?? "").Trim())
+                 .Where(v => v.Length > 0)
+                 .Distinct(StringComparer.OrdinalIgnoreCase)
+                 .ToArray();
+
     private static bool Equals(AppSettings a, AppSettings b)
-        => string.Equals(a.HrmisUrl, b.HrmisUrl, StringComparison.Ordinal) && a.Port == b.Port;
+        => string.Equals(a.HrmisUrl, b.HrmisUrl, StringComparison.Ordinal)
+           && a.Port == b.Port
+           && a.RemoteAccessEnabled == b.RemoteAccessEnabled
+           && a.AdminHttpsPort == b.AdminHttpsPort
+           && string.Equals(a.CertificatePath, b.CertificatePath, StringComparison.Ordinal)
+           && a.AllowedIps.SequenceEqual(b.AllowedIps, StringComparer.OrdinalIgnoreCase)
+           && a.DeviceAllowedIps.SequenceEqual(b.DeviceAllowedIps, StringComparer.OrdinalIgnoreCase);
 
     private static AppSettings LoadFromDisk()
     {
@@ -135,6 +203,12 @@ public sealed class SettingsService : IDisposable
                     if (!string.IsNullOrWhiteSpace(parsed.HrmisUrl))
                         s.HrmisUrl = parsed.HrmisUrl.TrimEnd('/');
                     if (parsed.Port > 0 && parsed.Port < 65536) s.Port = parsed.Port;
+                    s.RemoteAccessEnabled = parsed.RemoteAccessEnabled;
+                    if (parsed.AdminHttpsPort > 0 && parsed.AdminHttpsPort < 65536)
+                        s.AdminHttpsPort = parsed.AdminHttpsPort;
+                    s.AllowedIps = Clean(parsed.AllowedIps ?? Array.Empty<string>());
+                    s.DeviceAllowedIps = Clean(parsed.DeviceAllowedIps ?? Array.Empty<string>());
+                    s.CertificatePath = (parsed.CertificatePath ?? "").Trim();
                 }
             }
         }
@@ -142,6 +216,7 @@ public sealed class SettingsService : IDisposable
         {
             // malformed file shouldn't take the service down; fall back to defaults/env
         }
+        if (s.AdminHttpsPort == s.Port) s.AdminHttpsPort = s.Port + 1;
         return s;
     }
 
