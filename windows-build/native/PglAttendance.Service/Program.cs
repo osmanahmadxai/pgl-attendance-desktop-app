@@ -174,29 +174,101 @@ app.Use(async (ctx, next) =>
 });
 
 // ---------------------------------------------------------------------------
+// DEVICE CLOCK SYNC (ZK iClock / ADMS push protocol)
+//
+// In ADMS mode the terminal has no timezone of its own: on link-up it adopts
+// whatever the server hands it, and an OPTIONS block with no TimeZone line
+// leaves it on the factory China default (UTC+8) — 3h30m ahead of Kabul.
+//
+// Verified against a live ZMM720-NF (iClock Proxy/1.09) on 2026-09-14:
+//   * TimeZone must be sent in MINUTES (270); hours cannot express +04:30.
+//   * "SET OPTIONS DateTime" alone is ACKed (Return=0) but silently ignored —
+//     TimeZone has to land first.
+//   * After accepting the command the device calls back to GET
+//     /iclock/rtdata?type=time to fetch the value. Without that route it 404s
+//     and the clock never changes.
+//   * Restarting this service drops the connection and forces the device to
+//     re-handshake, which is how the new options get applied.
+// ---------------------------------------------------------------------------
+
+// Kabul is UTC+04:30 == 270 minutes.
+const string DeviceTimeZoneMinutes = "270";
+var clockResync = TimeSpan.FromHours(1);
+var lastClockPush = new System.Collections.Concurrent.ConcurrentDictionary<string, DateTime>();
+var deviceCommandId = new int[1];
+
+// Current Kabul wall clock in ZK's packed-integer encoding.
+static string KabulClockValue()
+{
+    var k = DateTime.UtcNow.AddMinutes(270);
+    var packed =
+        (((k.Year - 2000) * 12 * 31) + ((k.Month - 1) * 31) + (k.Day - 1)) * 86400
+        + (k.Hour * 3600) + (k.Minute * 60) + k.Second;
+    return packed.ToString(System.Globalization.CultureInfo.InvariantCulture);
+}
+
+// ---------------------------------------------------------------------------
 // Device handshake — ZK iClock devices GET here on boot to discover the
-// server's expected push schedule.  Without this they may refuse to POST data.
+// server's expected push schedule AND their timezone.  Without this they may
+// refuse to POST data; without TimeZone they keep the factory UTC+8 clock.
 // ---------------------------------------------------------------------------
 app.MapGet("/iclock/cdata", (HttpRequest req) =>
 {
     var sn = req.Query["SN"].ToString();
+
+    // A fresh link-up is exactly when the clock is forgotten, so let the next
+    // command poll re-push the wall clock too.
+    if (!string.IsNullOrEmpty(sn)) lastClockPush.TryRemove(sn, out _);
+
     // Minimal ZK-compatible "OPTIONS" reply.  Realtime=1 -> push data live.
+    // CRLF line endings: that is what the protocol specifies and what the live
+    // device was verified to accept.
     var reply =
-        $"GET OPTION FROM: {sn}\n" +
-        "Stamp=9999\n" +
-        "OpStamp=0\n" +
-        "ErrorDelay=30\n" +
-        "Delay=10\n" +
-        "TransTimes=00:00;14:05\n" +
-        "TransInterval=1\n" +
-        "TransFlag=TransData AttLog OpLog AttPhoto EnrollUser ChgUser EnrollFP ChgFP UserPic\n" +
-        "Realtime=1\n" +
-        "Encrypt=None\n";
+        $"GET OPTION FROM: {sn}\r\n" +
+        "Stamp=9999\r\n" +
+        "OpStamp=0\r\n" +
+        "ErrorDelay=30\r\n" +
+        "Delay=10\r\n" +
+        "TransTimes=00:00;14:05\r\n" +
+        "TransInterval=1\r\n" +
+        "TransFlag=TransData AttLog OpLog AttPhoto EnrollUser ChgUser EnrollFP ChgFP UserPic\r\n" +
+        $"TimeZone={DeviceTimeZoneMinutes}\r\n" +
+        "Realtime=1\r\n" +
+        "Encrypt=None\r\n";
     return Results.Text(reply, "text/plain");
 });
 
-// Devices poll this for queued commands.  We never queue anything -> empty body.
-app.MapGet("/iclock/getrequest", () => Results.Text("OK", "text/plain"));
+// Devices poll this for queued commands.  We answer with the Kabul timezone and
+// wall clock (throttled), otherwise "OK" meaning nothing queued.
+app.MapGet("/iclock/getrequest", (HttpRequest req) =>
+{
+    var sn = req.Query["SN"].ToString();
+    if (string.IsNullOrEmpty(sn)) return Results.Text("OK", "text/plain");
+
+    var now = DateTime.UtcNow;
+    if (lastClockPush.TryGetValue(sn, out var last) && now - last < clockResync)
+        return Results.Text("OK", "text/plain");
+
+    lastClockPush[sn] = now;
+
+    // TimeZone must precede DateTime: setting the clock alone is ignored.
+    var id1 = Interlocked.Increment(ref deviceCommandId[0]);
+    var id2 = Interlocked.Increment(ref deviceCommandId[0]);
+    var cmds =
+        $"C:{id1}:SET OPTIONS TimeZone={DeviceTimeZoneMinutes}\r\n" +
+        $"C:{id2}:SET OPTIONS DateTime={KabulClockValue()}";
+    return Results.Text(cmds, "text/plain");
+});
+
+// After accepting "SET OPTIONS DateTime" the device calls back HERE to fetch
+// the actual clock value. A 404 leaves it on its old timezone.
+app.MapGet("/iclock/rtdata", (HttpRequest req) =>
+{
+    var type = req.Query["type"].ToString();
+    if (!string.Equals(type, "time", StringComparison.OrdinalIgnoreCase))
+        return Results.Text("OK", "text/plain");
+    return Results.Text(KabulClockValue(), "text/plain");
+});
 
 // Devices report command execution results back here.  Acknowledge.
 app.MapPost("/iclock/devicecmd", () => Results.Text("OK", "text/plain"));
