@@ -1,6 +1,7 @@
 using System;
 using System.IO;
 using System.Linq;
+using System.Reflection;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
@@ -372,6 +373,19 @@ app.MapGet("/api/debug/recent", async ([FromServices] AttendanceRepository repo,
 // GET /api/health
 // ---------------------------------------------------------------------------
 var startedAt = DateTime.UtcNow;
+
+// Stamped by the build (-p:Version). The desktop app shows this next to its own
+// version so an upgrade that failed to replace the running service binary is
+// visible instead of silent — the two versions simply stop matching.
+static string ServiceVersion()
+{
+    var v = Assembly.GetEntryAssembly()?.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion
+            ?? Assembly.GetEntryAssembly()?.GetName().Version?.ToString()
+            ?? "unknown";
+    var plus = v.IndexOf('+');            // strip the "+<commit sha>" suffix
+    return plus >= 0 ? v.Substring(0, plus) : v;
+}
+
 app.MapGet("/api/health", ([FromServices] SettingsService settings) =>
 {
     var s = settings.Get();
@@ -379,6 +393,7 @@ app.MapGet("/api/health", ([FromServices] SettingsService settings) =>
     {
         ok = true,
         pid = Environment.ProcessId,
+        version = ServiceVersion(),
         uptimeSeconds = (int)(DateTime.UtcNow - startedAt).TotalSeconds,
         port = s.Port,
         hrmisUrl = s.HrmisUrl,

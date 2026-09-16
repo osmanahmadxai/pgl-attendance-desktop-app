@@ -64,7 +64,11 @@ Name: "{group}\Uninstall {#MyAppName}";    Filename: "{uninstallexe}"
 Name: "{autodesktop}\{#MyAppName}";        Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\app.ico"; Tasks: desktopicon
 
 [Run]
-; --- Stop any previously installed service (upgrades) ---
+; --- Deregister the previous service (upgrades) ---
+; It was already stopped in PrepareToInstall (see [Code]); this only removes the
+; registration so it can be recreated against the current {app} path. The stop
+; below is a harmless no-op kept for the case where the service was re-started
+; between the two steps.
 Filename: "{sys}\sc.exe"; Parameters: "stop ""{#MyServiceName}"""; Flags: runhidden waituntilterminated
 Filename: "{sys}\sc.exe"; Parameters: "delete ""{#MyServiceName}"""; Flags: runhidden waituntilterminated
 
@@ -104,6 +108,55 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: 
 ; Intentionally leave %PROGRAMDATA%\PGL Attendance\ in place so the DB + settings survive uninstall.
 
 [Code]
+// ---------------------------------------------------------------------------
+// Free the old service binary BEFORE [Files] copies the new one.
+//
+// Inno installs [Files] first and only runs [Run] — where sc.exe stops the
+// service — afterwards. On an upgrade that ordering is fatal: the old service
+// is still running, Windows holds its own exe locked, and the copy cannot
+// replace it. sc delete/create/start then re-registers and cheerfully starts
+// the OLD binary, while Setup reports success. Rebooting does not help either,
+// because without the 'restartreplace' flag nothing was ever queued for
+// replacement at boot.
+//
+// PrepareToInstall runs before any file is copied, which is the only place this
+// can be fixed. Deleting the old exe — rather than merely asking the service to
+// stop — is what proves the lock is actually gone.
+// ---------------------------------------------------------------------------
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+var
+  ResultCode, I: Integer;
+  ExePath: String;
+begin
+  Result := '';
+  NeedsRestart := False;
+
+  // Both of these hold files this installer replaces.
+  Exec(ExpandConstant('{sys}\sc.exe'), 'stop "{#MyServiceName}"', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Exec(ExpandConstant('{sys}\taskkill.exe'), '/f /im "{#MyAppExeName}"', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+
+  ExePath := ExpandConstant('{app}\{#MyServiceExe}');
+  if not FileExists(ExePath) then
+    Exit;   // fresh install: nothing to free
+
+  // The SCM stops services asynchronously, so poll instead of assuming. If the
+  // service is wedged and ignores the stop, kill it outright — it is about to
+  // be deleted and recreated anyway.
+  for I := 1 to 30 do
+  begin
+    if DeleteFile(ExePath) or (not FileExists(ExePath)) then
+      Exit;
+    if I = 5 then
+      Exec(ExpandConstant('{sys}\taskkill.exe'), '/f /im "{#MyServiceExe}"', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    Sleep(1000);
+  end;
+
+  // Never silently install over a locked binary: failing loudly here is the
+  // whole point, because the alternative looks like a successful upgrade.
+  Result := 'Setup could not stop the {#MyServiceDisplay} service, so the previous version could not be replaced.' + #13#10 + #13#10 +
+            'Close {#MyAppName}, then run this installer again.';
+end;
+
 function NeedRestart(): Boolean;
 begin
   Result := False;

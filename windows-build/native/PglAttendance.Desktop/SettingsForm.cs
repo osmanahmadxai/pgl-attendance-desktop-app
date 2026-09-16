@@ -2,6 +2,7 @@ using System;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Linq;
+using System.Reflection;
 using System.Threading.Tasks;
 using System.Windows.Forms;
 
@@ -57,6 +58,7 @@ public sealed class SettingsForm : Form
 
     private readonly Button _save = new();
     private readonly Button _cancel = new();
+    private readonly Label _version = new();
 
     private int _initialPort = 4001;
     private int _initialHttpsPort = 4443;
@@ -243,6 +245,17 @@ public sealed class SettingsForm : Form
             _save.Location = new Point(footer.Width - _save.Width - 28, 14);
             _cancel.Location = new Point(_save.Left - _cancel.Width - 8, 14);
         };
+        // Both versions live here because the installer replaces two separate
+        // exes. If the service binary was locked during an upgrade, this app is
+        // new while the service behind it is old, and that mismatch is otherwise
+        // invisible — the service still answers and still looks healthy.
+        _version.Font = FontLabel;
+        _version.ForeColor = TextSubtle;
+        _version.AutoSize = true;
+        _version.Location = new Point(28, 24);
+        _version.Text = $"Version {AppVersion}";
+        footer.Controls.Add(_version);
+
         footer.Controls.Add(_cancel);
         footer.Controls.Add(_save);
 
@@ -251,6 +264,7 @@ public sealed class SettingsForm : Form
         Controls.Add(header);
 
         Load += async (_, _) => await LoadCurrentAsync();
+        Load += async (_, _) => await ShowVersionsAsync();
     }
 
     // -------------------------------------------------------------------------
@@ -406,6 +420,52 @@ public sealed class SettingsForm : Form
                       || _remote.Checked != _initialRemote;
         _hint.Text = "   Saving will restart the background service to apply the new ports.";
         _hint.Visible = changed;
+    }
+
+    /// <summary>This app's version, without the "+&lt;commit sha&gt;" suffix.</summary>
+    private static string AppVersion
+    {
+        get
+        {
+            var asm = Assembly.GetExecutingAssembly();
+            var v = asm.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion
+                    ?? asm.GetName().Version?.ToString()
+                    ?? "unknown";
+            var plus = v.IndexOf('+');
+            return plus >= 0 ? v.Substring(0, plus) : v;
+        }
+    }
+
+    /// <summary>
+    /// Compares this app against the service it is talking to. They ship in the
+    /// same installer, so anything other than a match means the upgrade did not
+    /// fully land and the service is still running old code.
+    /// </summary>
+    private async Task ShowVersionsAsync()
+    {
+        var health = await _svc.GetHealthAsync();
+
+        if (health is null)
+        {
+            _version.ForeColor = TextSubtle;
+            _version.Text = $"App {AppVersion}  ·  service not reachable";
+            return;
+        }
+
+        // Services before 1.3.2 do not report a version at all, which is itself
+        // proof that the running binary predates this app.
+        if (string.IsNullOrWhiteSpace(health.Version))
+        {
+            _version.ForeColor = DangerFg;
+            _version.Text = $"App {AppVersion}  ·  service is older — reinstall";
+            return;
+        }
+
+        var match = string.Equals(health.Version, AppVersion, StringComparison.OrdinalIgnoreCase);
+        _version.ForeColor = match ? TextSubtle : DangerFg;
+        _version.Text = match
+            ? $"Version {AppVersion}"
+            : $"App {AppVersion}  ·  service {health.Version} — not updated";
     }
 
     private async Task LoadCurrentAsync()

@@ -28,6 +28,8 @@ public sealed class ServiceClient
         public int Port { get; set; }
         public string HrmisUrl { get; set; } = "";
         public int UptimeSeconds { get; set; }
+        /// <summary>Empty when talking to a service older than 1.3.2, which did not report one.</summary>
+        public string Version { get; set; } = "";
     }
 
     public async Task<HealthResp?> GetHealthAsync(CancellationToken ct = default)
@@ -45,6 +47,7 @@ public sealed class ServiceClient
                 Port = root.TryGetProperty("port", out var p) && p.TryGetInt32(out var pi) ? pi : Port,
                 HrmisUrl = root.TryGetProperty("hrmisUrl", out var h) ? (h.GetString() ?? "") : "",
                 UptimeSeconds = root.TryGetProperty("uptimeSeconds", out var u) && u.TryGetInt32(out var ui) ? ui : 0,
+                Version = root.TryGetProperty("version", out var v) ? (v.GetString() ?? "") : "",
             };
         }
         catch { return null; }
