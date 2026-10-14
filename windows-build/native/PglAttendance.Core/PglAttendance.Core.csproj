@@ -8,5 +8,9 @@
   </PropertyGroup>
   <ItemGroup>
     <PackageReference Include="Microsoft.Data.Sqlite" Version="8.0.10" />
+    <!-- Bundles the IANA timezone database, so zone names resolve the same on every machine.
+         The OS cannot be relied on: the service runs with InvariantGlobalization (no ICU), where
+         Windows does not understand names like Asia/Dubai. -->
+    <PackageReference Include="NodaTime" Version="3.2.0" />
   </ItemGroup>
 </Project>
