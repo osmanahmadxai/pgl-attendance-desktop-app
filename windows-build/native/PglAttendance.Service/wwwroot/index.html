@@ -113,6 +113,30 @@
       </div>
 
       <div class="section-rule"></div>
+      <div class="section-title">Device clock</div>
+
+      <div class="field">
+        <label class="field-label" for="setDeviceZone">Default device timezone</label>
+        <input class="input" id="setDeviceZone" list="deviceZoneList" spellcheck="false" autocomplete="off"
+               placeholder="e.g. Asia/Kabul">
+        <datalist id="deviceZoneList"></datalist>
+        <p class="field-hint">
+          The clock every attendance terminal is set to, and the timezone its punches are read on.
+          Pushed to the terminals within a minute &mdash; no restart. HRMIS is told which timezone each punch came from.
+        </p>
+      </div>
+
+      <div class="field">
+        <label class="field-label" for="setDeviceZones">Timezone for specific devices (optional)</label>
+        <input class="input" id="setDeviceZones" spellcheck="false" autocomplete="off"
+               placeholder="e.g. CDQ1234567=Asia/Dubai, CDQ7654321=Asia/Muscat">
+        <p class="field-hint">
+          Comma-separated <code>serial=zone</code> pairs. A terminal not listed uses the default above.
+        </p>
+        <p class="field-hint" id="devicesSeen"></p>
+      </div>
+
+      <div class="section-rule"></div>
       <div class="section-title">Browser access</div>
 
       <label class="check">

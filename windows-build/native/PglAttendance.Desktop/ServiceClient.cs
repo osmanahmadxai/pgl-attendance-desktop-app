@@ -150,6 +150,11 @@ public sealed class ServiceClient
         public string[] AllowedIps { get; set; } = Array.Empty<string>();
         public string[] DeviceAllowedIps { get; set; } = Array.Empty<string>();
 
+        // Clock the attendance terminals are set to
+        public string DeviceTimeZone { get; set; } = "Asia/Kabul";
+        public Dictionary<string, string> DeviceTimeZones { get; set; } = new();
+        public List<KnownDevice> KnownDevices { get; set; } = new();
+
         // Reported by the service; never a password or hash.
         public bool AccountConfigured { get; set; }
         public string Username { get; set; } = "";
@@ -158,6 +163,14 @@ public sealed class ServiceClient
         public bool CertificateSelfSigned { get; set; }
         public string? CertificateFingerprint { get; set; }
         public int MinPasswordLength { get; set; } = 12;
+    }
+
+    /// <summary>A terminal that has contacted the service since it started.</summary>
+    public sealed class KnownDevice
+    {
+        public string Serial { get; set; } = "";
+        public DateTime LastSeenUtc { get; set; }
+        public string TimeZone { get; set; } = "";
     }
 
     public async Task<CurrentSettings?> GetSettingsAsync(CancellationToken ct = default)
@@ -185,6 +198,8 @@ public sealed class ServiceClient
         int adminHttpsPort,
         string[] allowedIps,
         string[] deviceAllowedIps,
+        string deviceTimeZone,
+        Dictionary<string, string> deviceTimeZones,
         CancellationToken ct = default)
         => await UpdateSettingsAsync(new
         {
@@ -194,6 +209,8 @@ public sealed class ServiceClient
             adminHttpsPort,
             allowedIps,
             deviceAllowedIps,
+            deviceTimeZone,
+            deviceTimeZones,
         }, ct);
 
     private async Task<WriteResult> UpdateSettingsAsync(object payload, CancellationToken ct)

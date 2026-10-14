@@ -11,6 +11,24 @@ configurable TCP port (`/iclock/cdata`) and forwards it to the HRMIS API.
 No Node.js, no .NET runtime install required on the target PC — both exes are
 self-contained .NET 8 single-file binaries.
 
+## Device clock and timezones
+
+Attendance terminals running in ADMS mode have no timezone of their own: they adopt whatever this app hands them.
+**Settings → Device clock** (in the desktop app and in the browser UI) sets it:
+
+- **Default device timezone** — an IANA name such as `Asia/Kabul` (the default). Every terminal is set to it; the offset is
+  recomputed from the zone each time, so a daylight-saving zone follows its clock changes. A change reaches the terminals
+  on their next poll (about a minute), no restart.
+- **Timezone for specific devices** — optional `serial=zone` pairs for terminals in another country. The serial (`SN`) is
+  what the terminal sends; terminals that have contacted the service are listed under the field.
+
+Each stored punch records the terminal's serial and the zone it was set to when the punch arrived. When a punch is
+forwarded to HRMIS the **body stays byte-for-byte what the terminal sent**; the context rides in the URL instead:
+`POST {hrmisUrl}/iclock/cdata?SN=<serial>&tz=<IANA zone>`. HRMIS reads the wall-clock time on that zone and stores the real
+UTC instant. Records stored before this feature are forwarded without it (HRMIS reads them as Kabul, as it always did).
+The punch timestamp is still parsed only to order the queue — now on the real timeline, so punches from terminals in
+different countries leave in true chronological order.
+
 ## Install on any Windows PC (one PowerShell line)
 
 ```powershell

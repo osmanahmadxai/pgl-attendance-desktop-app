@@ -179,10 +179,13 @@ app.Use(async (ctx, next) =>
 //
 // In ADMS mode the terminal has no timezone of its own: on link-up it adopts
 // whatever the server hands it, and an OPTIONS block with no TimeZone line
-// leaves it on the factory China default (UTC+8) — 3h30m ahead of Kabul.
+// leaves it on the factory China default (UTC+8). The zone handed out is the
+// one set in Settings: a default for every terminal, with optional per-terminal
+// overrides keyed by serial number (SN). It is an IANA name; the offset sent is
+// worked out from it each time, so a daylight-saving zone follows its clock.
 //
 // Verified against a live ZMM720-NF (iClock Proxy/1.09) on 2026-09-14:
-//   * TimeZone must be sent in MINUTES (270); hours cannot express +04:30.
+//   * TimeZone must be sent in MINUTES (e.g. 270); hours cannot express +04:30.
 //   * "SET OPTIONS DateTime" alone is ACKed (Return=0) but silently ignored —
 //     TimeZone has to land first.
 //   * After accepting the command the device calls back to GET
@@ -192,20 +195,19 @@ app.Use(async (ctx, next) =>
 //     re-handshake, which is how the new options get applied.
 // ---------------------------------------------------------------------------
 
-// Kabul is UTC+04:30 == 270 minutes.
-const string DeviceTimeZoneMinutes = "270";
 var clockResync = TimeSpan.FromHours(1);
 var lastClockPush = new System.Collections.Concurrent.ConcurrentDictionary<string, DateTime>();
+var lastPushedOffset = new System.Collections.Concurrent.ConcurrentDictionary<string, int>();
+// Terminals seen since the service started (SN -> last contact), for the settings UI.
+var seenDevices = new System.Collections.Concurrent.ConcurrentDictionary<string, DateTime>();
 var deviceCommandId = new int[1];
 
-// Current Kabul wall clock in ZK's packed-integer encoding.
-static string KabulClockValue()
+// A changed zone must reach the terminals now, not at the next hourly resync.
+bootSettings.Changed += (_, _) => { lastClockPush.Clear(); lastPushedOffset.Clear(); };
+
+void NoteDevice(string sn)
 {
-    var k = DateTime.UtcNow.AddMinutes(270);
-    var packed =
-        (((k.Year - 2000) * 12 * 31) + ((k.Month - 1) * 31) + (k.Day - 1)) * 86400
-        + (k.Hour * 3600) + (k.Minute * 60) + k.Second;
-    return packed.ToString(System.Globalization.CultureInfo.InvariantCulture);
+    if (!string.IsNullOrWhiteSpace(sn)) seenDevices[sn.Trim()] = DateTime.UtcNow;
 }
 
 // ---------------------------------------------------------------------------
@@ -216,10 +218,14 @@ static string KabulClockValue()
 app.MapGet("/iclock/cdata", (HttpRequest req) =>
 {
     var sn = req.Query["SN"].ToString();
+    NoteDevice(sn);
 
     // A fresh link-up is exactly when the clock is forgotten, so let the next
     // command poll re-push the wall clock too.
     if (!string.IsNullOrEmpty(sn)) lastClockPush.TryRemove(sn, out _);
+
+    var zone = DeviceClock.ResolveOrDefault(bootSettings.ResolveDeviceZone(sn));
+    var offsetMinutes = DeviceClock.OffsetMinutes(zone, DateTime.UtcNow);
 
     // Minimal ZK-compatible "OPTIONS" reply.  Realtime=1 -> push data live.
     // CRLF line endings: that is what the protocol specifies and what the live
@@ -233,31 +239,38 @@ app.MapGet("/iclock/cdata", (HttpRequest req) =>
         "TransTimes=00:00;14:05\r\n" +
         "TransInterval=1\r\n" +
         "TransFlag=TransData AttLog OpLog AttPhoto EnrollUser ChgUser EnrollFP ChgFP UserPic\r\n" +
-        $"TimeZone={DeviceTimeZoneMinutes}\r\n" +
+        $"TimeZone={offsetMinutes.ToString(System.Globalization.CultureInfo.InvariantCulture)}\r\n" +
         "Realtime=1\r\n" +
         "Encrypt=None\r\n";
     return Results.Text(reply, "text/plain");
 });
 
-// Devices poll this for queued commands.  We answer with the Kabul timezone and
-// wall clock (throttled), otherwise "OK" meaning nothing queued.
+// Devices poll this for queued commands.  We answer with the terminal's
+// timezone and wall clock (throttled, and immediately when the offset changed —
+// a settings edit or a daylight-saving switch), otherwise "OK" meaning nothing queued.
 app.MapGet("/iclock/getrequest", (HttpRequest req) =>
 {
     var sn = req.Query["SN"].ToString();
     if (string.IsNullOrEmpty(sn)) return Results.Text("OK", "text/plain");
+    NoteDevice(sn);
 
     var now = DateTime.UtcNow;
-    if (lastClockPush.TryGetValue(sn, out var last) && now - last < clockResync)
+    var zone = DeviceClock.ResolveOrDefault(bootSettings.ResolveDeviceZone(sn));
+    var offsetMinutes = DeviceClock.OffsetMinutes(zone, now);
+
+    var offsetChanged = !lastPushedOffset.TryGetValue(sn, out var pushed) || pushed != offsetMinutes;
+    if (!offsetChanged && lastClockPush.TryGetValue(sn, out var last) && now - last < clockResync)
         return Results.Text("OK", "text/plain");
 
     lastClockPush[sn] = now;
+    lastPushedOffset[sn] = offsetMinutes;
 
     // TimeZone must precede DateTime: setting the clock alone is ignored.
     var id1 = Interlocked.Increment(ref deviceCommandId[0]);
     var id2 = Interlocked.Increment(ref deviceCommandId[0]);
     var cmds =
-        $"C:{id1}:SET OPTIONS TimeZone={DeviceTimeZoneMinutes}\r\n" +
-        $"C:{id2}:SET OPTIONS DateTime={KabulClockValue()}";
+        $"C:{id1}:SET OPTIONS TimeZone={offsetMinutes.ToString(System.Globalization.CultureInfo.InvariantCulture)}\r\n" +
+        $"C:{id2}:SET OPTIONS DateTime={DeviceClock.PackedWallClock(zone, now)}";
     return Results.Text(cmds, "text/plain");
 });
 
@@ -268,7 +281,10 @@ app.MapGet("/iclock/rtdata", (HttpRequest req) =>
     var type = req.Query["type"].ToString();
     if (!string.Equals(type, "time", StringComparison.OrdinalIgnoreCase))
         return Results.Text("OK", "text/plain");
-    return Results.Text(KabulClockValue(), "text/plain");
+    var sn = req.Query["SN"].ToString();
+    NoteDevice(sn);
+    var zone = DeviceClock.ResolveOrDefault(bootSettings.ResolveDeviceZone(sn));
+    return Results.Text(DeviceClock.PackedWallClock(zone, DateTime.UtcNow), "text/plain");
 });
 
 // Devices report command execution results back here.  Acknowledge.
@@ -290,7 +306,14 @@ app.MapPost("/iclock/cdata", async (HttpRequest req, SyncEngine engine) =>
         Console.WriteLine($"Device info received: {raw}");
         return Results.Text("OK", "text/plain");
     }
-    await engine.SaveAttendanceAsync(raw);
+    // Which terminal sent it, and the clock that terminal is set to right now,
+    // are recorded with each punch; the punch itself is stored untouched.
+    var sn = req.Query["SN"].ToString().Trim();
+    NoteDevice(sn);
+    await engine.SaveAttendanceAsync(
+        raw,
+        sn.Length > 0 ? sn : null,
+        bootSettings.ResolveDeviceZone(sn));
     return Results.Text("OK", "text/plain");
 });
 
@@ -416,6 +439,11 @@ app.MapGet("/api/settings", ([FromServices] SettingsService settings, [FromServi
         allowedIps = s.AllowedIps,
         deviceAllowedIps = s.DeviceAllowedIps,
         certificatePath = s.CertificatePath,
+        deviceTimeZone = s.DeviceTimeZone,
+        deviceTimeZones = s.DeviceTimeZones,
+        knownDevices = seenDevices
+            .OrderByDescending(d => d.Value)
+            .Select(d => new { serial = d.Key, lastSeenUtc = d.Value, timeZone = settings.ResolveDeviceZone(d.Key) }),
         // Never the password or its hash — only whether an account exists.
         accountConfigured = sec.Credentials.IsConfigured,
         username = sec.Credentials.Username,
@@ -454,6 +482,16 @@ app.MapPut("/api/settings", async (
             return Results.BadRequest(new { message = $"'{rule}' is not a valid IP address or CIDR range" });
     }
 
+    if (body.DeviceTimeZone is not null && !DeviceClock.TryResolve(body.DeviceTimeZone, out _, out _))
+        return Results.BadRequest(new { message = $"'{body.DeviceTimeZone}' is not a timezone this computer knows (use a name like Asia/Kabul)" });
+    foreach (var (serial, zoneName) in body.DeviceTimeZones ?? new Dictionary<string, string>())
+    {
+        if (string.IsNullOrWhiteSpace(serial))
+            return Results.BadRequest(new { message = "a device serial number is empty" });
+        if (!DeviceClock.TryResolve(zoneName, out _, out _))
+            return Results.BadRequest(new { message = $"'{zoneName}' (device {serial}) is not a timezone this computer knows" });
+    }
+
     // Refusing to open the browser surface without an account is what stops a
     // toggle from ever exposing an unauthenticated API.
     if (body.RemoteAccessEnabled == true && !sec.Credentials.IsConfigured)
@@ -469,7 +507,9 @@ app.MapPut("/api/settings", async (
         AdminHttpsPort: body.AdminHttpsPort,
         AllowedIps: body.AllowedIps,
         DeviceAllowedIps: body.DeviceAllowedIps,
-        CertificatePath: body.CertificatePath));
+        CertificatePath: body.CertificatePath,
+        DeviceTimeZone: body.DeviceTimeZone,
+        DeviceTimeZones: body.DeviceTimeZones));
 
     await Task.CompletedTask;
     return Results.Json(new { ok = true, settings = next });
@@ -671,7 +711,9 @@ public sealed record UpdateSettingsDto(
     string[]? AllowedIps,
     string[]? DeviceAllowedIps,
     string? CertificatePath,
-    string? CertificatePassword);
+    string? CertificatePassword,
+    string? DeviceTimeZone = null,
+    Dictionary<string, string>? DeviceTimeZones = null);
 
 public sealed record LoginDto(string? Username, string? Password);
 

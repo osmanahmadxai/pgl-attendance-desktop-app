@@ -25,7 +25,10 @@ namespace PglAttendance.Service.Sync;
 ///      because HRMIS pairs check-outs against previously received check-ins.
 ///   3. Verbatim payload: rawData is POSTed exactly as the device sent it —
 ///      the timestamp is parsed only for ordering, never rewritten, and no
-///      timezone conversion is applied anywhere.
+///      timezone conversion is applied to it. Which terminal sent it and the
+///      clock that terminal was set to ride alongside as URL query parameters
+///      (SN, tz), recorded when the punch arrived, so HRMIS can read the wall
+///      clock on the right zone. The body is never touched.
 ///   4. Order-preserving retries: a transient failure (HRMIS down / network /
 ///      5xx) re-queues the SAME record and backs off — later records are never
 ///      sent ahead of it. A permanent rejection (HRMIS 4xx or non-OK body) is
@@ -118,7 +121,7 @@ public sealed class SyncEngine : IHostedService, IDisposable
     // Ingestion: called for every device POST body. Non-attendance lines are
     // dropped here, so the database only ever holds attendance records.
     // ------------------------------------------------------------------
-    public async Task<int> SaveAttendanceAsync(string rawData)
+    public async Task<int> SaveAttendanceAsync(string rawData, string? deviceSerial = null, string? deviceTimeZone = null)
     {
         var lines = (rawData ?? "").Split('\n');
         var saved = 0;
@@ -147,7 +150,7 @@ public sealed class SyncEngine : IHostedService, IDisposable
 
             saved++;
 
-            var (row, isNew) = await _repo.InsertOrGetAsync(line);
+            var (row, isNew) = await _repo.InsertOrGetAsync(line, deviceSerial, deviceTimeZone);
             if (isNew)
             {
                 _logger.LogInformation("Saved raw attendance ID {Id}: {Line}", row.Id, line);
@@ -169,7 +172,7 @@ public sealed class SyncEngine : IHostedService, IDisposable
             // Sync immediately when possible; if HRMIS is down the record just
             // stays pending in the queue and retries in order.
             if (!row.IsSynced)
-                await TryEnqueueAsync(row.Id, row.RawData);
+                await TryEnqueueAsync(row.Id, row.RawData, row.DeviceSerial, row.DeviceTimeZone);
         }
 
         // One stats broadcast per POST body, not one per line — a large batch
@@ -182,7 +185,7 @@ public sealed class SyncEngine : IHostedService, IDisposable
     // ------------------------------------------------------------------
     // Queue admission — the single gate every record passes through.
     // ------------------------------------------------------------------
-    private async Task<bool> TryEnqueueAsync(long id, string rawData)
+    private async Task<bool> TryEnqueueAsync(long id, string rawData, string? deviceSerial, string? deviceTimeZone)
     {
         if (AttendanceParser.IsOplog(rawData))
             return false;
@@ -203,22 +206,28 @@ public sealed class SyncEngine : IHostedService, IDisposable
             return false;
         }
 
-        var key = KeyFor(id, rawData);
+        var key = KeyFor(id, rawData, deviceTimeZone);
         lock (_queueLock)
         {
             if (!_queuedIds.Add(id)) return false; // already queued or in flight
-            _queue.Enqueue(new QueueItem(id, rawData, 0), key);
+            _queue.Enqueue(new QueueItem(id, rawData, deviceSerial, deviceTimeZone, 0), key);
         }
         return true;
     }
 
-    private static PunchKey KeyFor(long id, string rawData)
+    private static PunchKey KeyFor(long id, string rawData, string? deviceTimeZone)
     {
         // Parsed only to decide ordering; the payload itself is never touched.
-        // A record whose timestamp fields pass the format gate but aren't a
-        // real calendar date/time sorts LAST (MaxValue), so a freak record can
-        // never jump ahead of legitimate punches.
-        var punch = AttendanceParser.TryGetPunchTimestamp(rawData, out var dt) ? dt : DateTime.MaxValue;
+        // The device's wall clock is placed on the real timeline using the zone
+        // it was set to, so terminals in different countries interleave in true
+        // chronological order (rows from before the zone was recorded were all
+        // Kabul). A record whose timestamp fields pass the format gate but
+        // aren't a real calendar date/time sorts LAST (MaxValue), so a freak
+        // record can never jump ahead of legitimate punches.
+        var punch = AttendanceParser.TryGetPunchTimestamp(rawData, out var wall)
+                    && DeviceClock.TryPunchUtc(wall, deviceTimeZone, out var utc)
+            ? utc
+            : DateTime.MaxValue;
         return new PunchKey(punch, id);
     }
 
@@ -270,7 +279,7 @@ public sealed class SyncEngine : IHostedService, IDisposable
                 return;
             }
 
-            var result = await _hrmis.PostAsync(_settings.HrmisUrl, item.RawData);
+            var result = await _hrmis.PostAsync(_settings.HrmisUrl, item.RawData, item.DeviceSerial, item.DeviceTimeZone);
 
             if (result.Ok)
             {
@@ -343,7 +352,7 @@ public sealed class SyncEngine : IHostedService, IDisposable
         lock (_queueLock)
         {
             _queuedIds.Add(item.Id);
-            _queue.Enqueue(item, KeyFor(item.Id, item.RawData));
+            _queue.Enqueue(item, KeyFor(item.Id, item.RawData, item.DeviceTimeZone));
         }
     }
 
@@ -387,8 +396,8 @@ public sealed class SyncEngine : IHostedService, IDisposable
         }
         var rows = await _repo.GetUnsyncedByIdsAsync(ids);
         var queued = 0;
-        foreach (var (id, raw) in rows)
-            if (await TryEnqueueAsync(id, raw)) queued++;
+        foreach (var r in rows)
+            if (await TryEnqueueAsync(r.Id, r.RawData, r.DeviceSerial, r.DeviceTimeZone)) queued++;
         return new SyncResult(true, $"Sync initiated for {queued} record(s)");
     }
 
@@ -397,8 +406,8 @@ public sealed class SyncEngine : IHostedService, IDisposable
         var rows = await _repo.GetUnsyncedForSyncAllAsync();
         if (rows.Count == 0) return new SyncResult(true, "No unsynced records found");
         var queued = 0;
-        foreach (var (id, raw) in rows)
-            if (await TryEnqueueAsync(id, raw)) queued++;
+        foreach (var r in rows)
+            if (await TryEnqueueAsync(r.Id, r.RawData, r.DeviceSerial, r.DeviceTimeZone)) queued++;
         return new SyncResult(true,
             $"Sync initiated: {queued} record(s) queued, {rows.Count - queued} already queued or excluded");
     }
@@ -422,7 +431,7 @@ public sealed class SyncEngine : IHostedService, IDisposable
     }
 
     /// <summary>ResponseFailures counts consecutive answered-error attempts (poison-record cap).</summary>
-    private readonly record struct QueueItem(long Id, string RawData, int ResponseFailures);
+    private readonly record struct QueueItem(long Id, string RawData, string? DeviceSerial, string? DeviceTimeZone, int ResponseFailures);
 
     /// <summary>Chronological order: punch timestamp, then row id.</summary>
     private readonly record struct PunchKey(DateTime Punch, long Id) : IComparable<PunchKey>

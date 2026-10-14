@@ -1,10 +1,12 @@
 using System;
+using System.Collections.Generic;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Linq;
 using System.Reflection;
 using System.Threading.Tasks;
 using System.Windows.Forms;
+using PglAttendance.Core;
 
 namespace PglAttendance.Desktop;
 
@@ -41,6 +43,11 @@ public sealed class SettingsForm : Form
     private readonly TextBox _hrmis = new();
     private readonly NumericUpDown _port = new();
     private readonly Label _hint = new();
+
+    // Device clock
+    private readonly ComboBox _deviceZone = new();
+    private readonly TextBox _deviceZones = new();
+    private readonly Label _devicesSeen = new();
 
     // Browser access
     private readonly CheckBox _remote = new();
@@ -147,6 +154,40 @@ public sealed class SettingsForm : Form
         };
         body.Controls.Add(_hint);
         _port.ValueChanged += (_, _) => UpdateRestartHint();
+        y += 44;
+
+        // --- Device clock ----------------------------------------------------
+        AddSectionRule(body, ref y);
+        AddSectionTitle(body, "Device clock", ref y);
+
+        AddLabel(body, "Default device timezone", ref y);
+        _deviceZone.Location = new Point(LeftMargin, y);
+        _deviceZone.Width = FieldWidth;
+        _deviceZone.Font = new("Segoe UI", 9.5F);
+        _deviceZone.DropDownStyle = ComboBoxStyle.DropDown;
+        _deviceZone.AutoCompleteMode = AutoCompleteMode.SuggestAppend;
+        _deviceZone.AutoCompleteSource = AutoCompleteSource.ListItems;
+        _deviceZone.Items.AddRange(DeviceClock.ListZoneNames().Cast<object>().ToArray());
+        body.Controls.Add(_deviceZone);
+        y += 32;
+        AddHint(body, "The clock every terminal is set to, and the zone its punches are read on. Pushed to the terminals within a minute — no restart. HRMIS is told which zone each punch came from.", ref y);
+        y += 18;
+
+        y += 12;
+        AddLabel(body, "Timezone for specific devices (optional)", ref y);
+        StyleTextField(_deviceZones, new Point(LeftMargin, y), FieldWidth);
+        body.Controls.Add(_deviceZones);
+        y += 30;
+        AddHint(body, "Comma-separated  serial=zone  pairs, e.g.  CDQ1234567=Asia/Dubai, CDQ7654321=Asia/Muscat.  A terminal not listed uses the default above.", ref y);
+        y += 18;
+
+        _devicesSeen.Location = new Point(LeftMargin, y);
+        _devicesSeen.AutoSize = false;
+        _devicesSeen.Width = FieldWidth;
+        _devicesSeen.Height = 34;
+        _devicesSeen.Font = FontMono;
+        _devicesSeen.ForeColor = TextSubtle;
+        body.Controls.Add(_devicesSeen);
         y += 44;
 
         // --- Browser access --------------------------------------------------
@@ -484,6 +525,11 @@ public sealed class SettingsForm : Form
         _remote.Checked = cur.RemoteAccessEnabled;
         _allowedIps.Text = string.Join(", ", cur.AllowedIps);
         _deviceIps.Text = string.Join(", ", cur.DeviceAllowedIps);
+        _deviceZone.Text = cur.DeviceTimeZone;
+        _deviceZones.Text = string.Join(", ", cur.DeviceTimeZones.Select(kv => $"{kv.Key}={kv.Value}"));
+        _devicesSeen.Text = cur.KnownDevices.Count == 0
+            ? "No terminal has contacted this service since it started."
+            : "Terminals seen: " + string.Join("   ", cur.KnownDevices.Select(d => $"{d.Serial} ({d.TimeZone})"));
         _username.Text = cur.Username;
 
         _initialPort = cur.Port;
@@ -536,6 +582,28 @@ public sealed class SettingsForm : Form
             return;
         }
 
+        var deviceZone = _deviceZone.Text.Trim();
+        if (!DeviceClock.TryResolve(deviceZone, out _, out var canonicalZone))
+        {
+            Warn("The default device timezone is not one this computer knows. Use a name like Asia/Kabul.");
+            return;
+        }
+        deviceZone = canonicalZone;
+
+        var deviceZones = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var entry in SplitList(_deviceZones.Text))
+        {
+            var eq = entry.IndexOf('=');
+            var serial = eq > 0 ? entry[..eq].Trim() : "";
+            var zoneName = eq > 0 ? entry[(eq + 1)..].Trim() : "";
+            if (serial.Length == 0 || !DeviceClock.TryResolve(zoneName, out _, out var perDevice))
+            {
+                Warn($"'{entry}' is not a valid device entry. Use  serial=zone,  for example  CDQ1234567=Asia/Dubai.");
+                return;
+            }
+            deviceZones[serial] = perDevice;
+        }
+
         var newPw = _newPw.Text;
         var confirmPw = _confirmPw.Text;
         if (newPw.Length > 0 || confirmPw.Length > 0)
@@ -580,7 +648,9 @@ public sealed class SettingsForm : Form
                 _remote.Checked,
                 newHttpsPort,
                 SplitList(_allowedIps.Text),
-                SplitList(_deviceIps.Text));
+                SplitList(_deviceIps.Text),
+                deviceZone,
+                deviceZones);
 
             if (!result.Ok)
             {

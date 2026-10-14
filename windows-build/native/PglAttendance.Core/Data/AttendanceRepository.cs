@@ -63,6 +63,25 @@ DROP INDEX IF EXISTS ""idx_rawattendance_rawdata"";
 CREATE UNIQUE INDEX IF NOT EXISTS ""uq_rawattendance_rawdata"" ON ""RawAttendance""(""rawData"");
 ";
         migrate.ExecuteNonQuery();
+
+        // Which terminal sent a punch, and the clock it was set to at the time.
+        // Added in place so existing databases keep every row (and its sync state).
+        EnsureColumn(conn, "deviceSerial", "TEXT");
+        EnsureColumn(conn, "deviceTimeZone", "TEXT");
+    }
+
+    private static void EnsureColumn(SqliteConnection conn, string column, string type)
+    {
+        using var info = conn.CreateCommand();
+        info.CommandText = @"PRAGMA table_info(""RawAttendance"");";
+        using (var rdr = info.ExecuteReader())
+        {
+            while (rdr.Read())
+                if (string.Equals(rdr.GetString(1), column, StringComparison.OrdinalIgnoreCase)) return;
+        }
+        using var alter = conn.CreateCommand();
+        alter.CommandText = $@"ALTER TABLE ""RawAttendance"" ADD COLUMN ""{column}"" {type};";
+        alter.ExecuteNonQuery();
     }
 
     /// <summary>
@@ -72,17 +91,20 @@ CREATE UNIQUE INDEX IF NOT EXISTS ""uq_rawattendance_rawdata"" ON ""RawAttendanc
     /// half of the exactly-once guarantee — the same physical punch can never
     /// occupy two rows, so it can never be synced twice.
     /// </summary>
-    public async Task<(RawAttendance Row, bool IsNew)> InsertOrGetAsync(string rawData)
+    public async Task<(RawAttendance Row, bool IsNew)> InsertOrGetAsync(
+        string rawData, string? deviceSerial = null, string? deviceTimeZone = null)
     {
         await using var conn = Open();
         await using var cmd = conn.CreateCommand();
         cmd.CommandText = @"
-INSERT INTO ""RawAttendance"" (""rawData"", ""isSynced"")
-SELECT $r, 0
+INSERT INTO ""RawAttendance"" (""rawData"", ""isSynced"", ""deviceSerial"", ""deviceTimeZone"")
+SELECT $r, 0, $sn, $tz
 WHERE NOT EXISTS (SELECT 1 FROM ""RawAttendance"" WHERE ""rawData"" = $r);
-SELECT ""id"", ""rawData"", ""isSynced"", ""createdAt"", ""retryCount"", ""lastError"", changes() AS ""inserted""
+SELECT ""id"", ""rawData"", ""isSynced"", ""createdAt"", ""retryCount"", ""lastError"", ""deviceSerial"", ""deviceTimeZone"", changes() AS ""inserted""
 FROM ""RawAttendance"" WHERE ""rawData"" = $r ORDER BY ""id"" LIMIT 1;";
         cmd.Parameters.AddWithValue("$r", rawData);
+        cmd.Parameters.AddWithValue("$sn", (object?)deviceSerial ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$tz", (object?)deviceTimeZone ?? DBNull.Value);
         await using var rdr = await cmd.ExecuteReaderAsync();
         if (!await rdr.ReadAsync())
             throw new InvalidOperationException("insert failed");
@@ -285,19 +307,16 @@ LIMIT $n;";
     /// All unsynced non-OPLOG rows for "sync all", id asc. Final send order is
     /// decided by the engine's priority queue (oldest punch timestamp first).
     /// </summary>
-    public async Task<List<(long Id, string RawData)>> GetUnsyncedForSyncAllAsync()
+    public async Task<List<PendingRecord>> GetUnsyncedForSyncAllAsync()
     {
         await using var conn = Open();
         await using var cmd = conn.CreateCommand();
         cmd.CommandText = @"
-SELECT ""id"", ""rawData"" FROM ""RawAttendance""
+SELECT ""id"", ""rawData"", ""deviceSerial"", ""deviceTimeZone"" FROM ""RawAttendance""
 WHERE ""isSynced"" = 0
   AND ""rawData"" NOT LIKE 'OPLOG%'
 ORDER BY ""id"" ASC;";
-        var rows = new List<(long, string)>();
-        await using var rdr = await cmd.ExecuteReaderAsync();
-        while (await rdr.ReadAsync()) rows.Add((rdr.GetInt64(0), rdr.GetString(1)));
-        return rows;
+        return await ReadPendingAsync(cmd);
     }
 
     public async Task<List<long>> GetAlreadySyncedAmongAsync(IEnumerable<long> ids)
@@ -314,18 +333,30 @@ ORDER BY ""id"" ASC;";
         return result;
     }
 
-    public async Task<List<(long Id, string RawData)>> GetUnsyncedByIdsAsync(IEnumerable<long> ids)
+    public async Task<List<PendingRecord>> GetUnsyncedByIdsAsync(IEnumerable<long> ids)
     {
         var arr = new List<long>(ids);
         if (arr.Count == 0) return new();
         await using var conn = Open();
         await using var cmd = conn.CreateCommand();
         var placeholders = string.Join(",", BuildPlaceholders(arr.Count, cmd, arr));
-        cmd.CommandText = @$"SELECT ""id"", ""rawData"" FROM ""RawAttendance""
+        cmd.CommandText = @$"SELECT ""id"", ""rawData"", ""deviceSerial"", ""deviceTimeZone"" FROM ""RawAttendance""
 WHERE ""id"" IN ({placeholders}) AND ""isSynced"" = 0;";
-        var rows = new List<(long, string)>();
+        return await ReadPendingAsync(cmd);
+    }
+
+    private static async Task<List<PendingRecord>> ReadPendingAsync(SqliteCommand cmd)
+    {
+        var rows = new List<PendingRecord>();
         await using var rdr = await cmd.ExecuteReaderAsync();
-        while (await rdr.ReadAsync()) rows.Add((rdr.GetInt64(0), rdr.GetString(1)));
+        while (await rdr.ReadAsync())
+        {
+            rows.Add(new PendingRecord(
+                rdr.GetInt64(0),
+                rdr.GetString(1),
+                rdr.IsDBNull(2) ? null : rdr.GetString(2),
+                rdr.IsDBNull(3) ? null : rdr.GetString(3)));
+        }
         return rows;
     }
 
@@ -387,5 +418,18 @@ WHERE ""id"" IN ({placeholders}) AND ""isSynced"" = 0;";
         CreatedAt = rdr.GetDateTime(rdr.GetOrdinal("createdAt")),
         RetryCount = rdr.GetInt32(rdr.GetOrdinal("retryCount")),
         LastError = rdr.IsDBNull(rdr.GetOrdinal("lastError")) ? null : rdr.GetString(rdr.GetOrdinal("lastError")),
+        DeviceSerial = OptionalText(rdr, "deviceSerial"),
+        DeviceTimeZone = OptionalText(rdr, "deviceTimeZone"),
     };
+
+    /// <summary>Text of a column that only some queries select; null when absent or NULL.</summary>
+    private static string? OptionalText(IDataReader rdr, string column)
+    {
+        for (var i = 0; i < rdr.FieldCount; i++)
+        {
+            if (string.Equals(rdr.GetName(i), column, StringComparison.OrdinalIgnoreCase))
+                return rdr.IsDBNull(i) ? null : rdr.GetString(i);
+        }
+        return null;
+    }
 }

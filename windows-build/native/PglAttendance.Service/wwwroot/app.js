@@ -323,6 +323,15 @@
       el.setHttpsPort.value = s.adminHttpsPort;
       el.setAllowedIps.value = (s.allowedIps || []).join(', ');
       el.setDeviceIps.value = (s.deviceAllowedIps || []).join(', ');
+      el.setDeviceZone.value = s.deviceTimeZone || 'Asia/Kabul';
+      el.setDeviceZones.value = Object.keys(s.deviceTimeZones || {}).map(function (sn) {
+        return sn + '=' + s.deviceTimeZones[sn];
+      }).join(', ');
+      var seen = s.knownDevices || [];
+      text(el.devicesSeen, seen.length === 0
+        ? 'No terminal has contacted this service since it started.'
+        : 'Terminals seen: ' + seen.map(function (d) { return d.serial + ' (' + d.timeZone + ')'; }).join('   '));
+      fillZoneList();
       el.setUsername.value = s.username || '';
       el.setCurrentPassword.value = '';
       el.setNewPassword.value = '';
@@ -343,6 +352,33 @@
     });
   }
 
+  // Timezone names for the device-clock field (the browser knows the IANA list).
+  function fillZoneList() {
+    if (el.deviceZoneList.options.length > 0) return;
+    var names = [];
+    try { names = Intl.supportedValuesOf('timeZone'); } catch (e) { names = []; }
+    if (names.indexOf('Asia/Kabul') === -1) names.push('Asia/Kabul');
+    names.sort().forEach(function (name) {
+      var opt = document.createElement('option');
+      opt.value = name;
+      el.deviceZoneList.appendChild(opt);
+    });
+  }
+
+  // "serial=zone, serial=zone" -> { serial: zone }, or null when an entry is malformed.
+  function parseDeviceZones(value) {
+    var out = {};
+    var entries = splitList(value);
+    for (var i = 0; i < entries.length; i++) {
+      var eq = entries[i].indexOf('=');
+      var serial = eq > 0 ? entries[i].slice(0, eq).trim() : '';
+      var zone = eq > 0 ? entries[i].slice(eq + 1).trim() : '';
+      if (!serial || !zone) { showSettingsError("'" + entries[i] + "' is not a valid device entry. Use serial=zone, e.g. CDQ1234567=Asia/Dubai."); return null; }
+      out[serial] = zone;
+    }
+    return out;
+  }
+
   function splitList(value) {
     return (value || '').split(',').map(function (v) { return v.trim(); })
       .filter(function (v) { return v.length > 0; });
@@ -358,6 +394,9 @@
         return;
       }
     }
+
+    var deviceZones = parseDeviceZones(el.setDeviceZones.value);
+    if (deviceZones === null) return;
 
     el.btnSettingsSave.disabled = true;
 
@@ -391,7 +430,9 @@
           remoteAccessEnabled: el.setRemote.checked,
           adminHttpsPort: parseInt(el.setHttpsPort.value, 10),
           allowedIps: splitList(el.setAllowedIps.value),
-          deviceAllowedIps: splitList(el.setDeviceIps.value)
+          deviceAllowedIps: splitList(el.setDeviceIps.value),
+          deviceTimeZone: el.setDeviceZone.value.trim(),
+          deviceTimeZones: deviceZones
         })
       });
     }).then(function (res) {
@@ -443,6 +484,8 @@
       settingsModal: $('settingsModal'), settingsWarn: $('settingsWarn'),
       setHrmis: $('setHrmis'), setPort: $('setPort'), setRemote: $('setRemote'),
       setHttpsPort: $('setHttpsPort'), setAllowedIps: $('setAllowedIps'), setDeviceIps: $('setDeviceIps'),
+      setDeviceZone: $('setDeviceZone'), setDeviceZones: $('setDeviceZones'),
+      devicesSeen: $('devicesSeen'), deviceZoneList: $('deviceZoneList'),
       setUsername: $('setUsername'), setCurrentPassword: $('setCurrentPassword'),
       setNewPassword: $('setNewPassword'), setConfirmPassword: $('setConfirmPassword'),
       currentPasswordHint: $('currentPasswordHint'), passwordRule: $('passwordRule'),

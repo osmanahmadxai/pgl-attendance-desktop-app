@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Text.Json.Serialization;
 
 namespace PglAttendance.Core;
@@ -47,6 +48,17 @@ public sealed class AppSettings
     [JsonPropertyName("certificatePath")]
     public string CertificatePath { get; set; } = "";
 
+    /// <summary>
+    /// The clock attendance terminals are set to unless one is listed in
+    /// <see cref="DeviceTimeZones"/>. An IANA name such as <c>Asia/Kabul</c>.
+    /// </summary>
+    [JsonPropertyName("deviceTimeZone")]
+    public string DeviceTimeZone { get; set; } = DeviceClock.DefaultZone;
+
+    /// <summary>Per-terminal clocks: serial number (SN) → IANA zone name.</summary>
+    [JsonPropertyName("deviceTimeZones")]
+    public Dictionary<string, string> DeviceTimeZones { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+
     public AppSettings Clone() => new()
     {
         HrmisUrl = HrmisUrl,
@@ -56,5 +68,7 @@ public sealed class AppSettings
         AllowedIps = (string[])AllowedIps.Clone(),
         DeviceAllowedIps = (string[])DeviceAllowedIps.Clone(),
         CertificatePath = CertificatePath,
+        DeviceTimeZone = DeviceTimeZone,
+        DeviceTimeZones = new Dictionary<string, string>(DeviceTimeZones, StringComparer.OrdinalIgnoreCase),
     };
 }

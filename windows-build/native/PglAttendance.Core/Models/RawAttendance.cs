@@ -26,7 +26,18 @@ public sealed class RawAttendance
 
     [JsonPropertyName("lastError")]
     public string? LastError { get; set; }
+
+    /// <summary>Serial number (SN) of the terminal that sent the punch; null for rows stored before this was recorded.</summary>
+    [JsonPropertyName("deviceSerial")]
+    public string? DeviceSerial { get; set; }
+
+    /// <summary>The clock zone the terminal was set to when it sent the punch (IANA name); null for older rows.</summary>
+    [JsonPropertyName("deviceTimeZone")]
+    public string? DeviceTimeZone { get; set; }
 }
+
+/// <summary>A stored punch that has not reached HRMIS yet, with the context it is forwarded with.</summary>
+public readonly record struct PendingRecord(long Id, string RawData, string? DeviceSerial, string? DeviceTimeZone);
 
 /// <summary>
 /// Parsed view sent over the wire to the desktop UI — matches the

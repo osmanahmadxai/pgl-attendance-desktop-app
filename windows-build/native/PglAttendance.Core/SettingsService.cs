@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Text.Json;
@@ -18,7 +19,9 @@ public sealed record SettingsPatch(
     int? AdminHttpsPort = null,
     string[]? AllowedIps = null,
     string[]? DeviceAllowedIps = null,
-    string? CertificatePath = null);
+    string? CertificatePath = null,
+    string? DeviceTimeZone = null,
+    IReadOnlyDictionary<string, string>? DeviceTimeZones = null);
 
 /// <summary>
 /// File-backed settings store: loads JSON from
@@ -106,6 +109,10 @@ public sealed class SettingsService : IDisposable
                 next.DeviceAllowedIps = Clean(patch.DeviceAllowedIps);
             if (patch.CertificatePath is not null)
                 next.CertificatePath = patch.CertificatePath.Trim();
+            if (patch.DeviceTimeZone is not null && DeviceClock.TryResolve(patch.DeviceTimeZone, out _, out var zone))
+                next.DeviceTimeZone = zone;
+            if (patch.DeviceTimeZones is not null)
+                next.DeviceTimeZones = CleanZones(patch.DeviceTimeZones);
 
             // The two ports must differ, otherwise Kestrel fails to bind and the
             // device listener would go down with the admin one.
@@ -170,6 +177,35 @@ public sealed class SettingsService : IDisposable
         }
     }
 
+    /// <summary>Keeps only entries with a serial and a zone this machine knows.</summary>
+    private static Dictionary<string, string> CleanZones(IEnumerable<KeyValuePair<string, string>> values)
+    {
+        var clean = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var (serial, zone) in values)
+        {
+            var sn = (serial ?? "").Trim();
+            if (sn.Length == 0 || sn.Length > 64) continue;
+            if (DeviceClock.TryResolve(zone, out _, out var canonical)) clean[sn] = canonical;
+        }
+        return clean;
+    }
+
+    /// <summary>
+    /// The clock zone for the terminal with this serial number: its own entry,
+    /// else the default zone. Always a zone this machine can resolve.
+    /// </summary>
+    public string ResolveDeviceZone(string? serial)
+    {
+        lock (_lock)
+        {
+            var sn = (serial ?? "").Trim();
+            if (sn.Length > 0 && _current.DeviceTimeZones.TryGetValue(sn, out var own)
+                && DeviceClock.TryResolve(own, out _, out var ownCanonical))
+                return ownCanonical;
+            return DeviceClock.TryResolve(_current.DeviceTimeZone, out _, out var def) ? def : DeviceClock.DefaultZone;
+        }
+    }
+
     private static string[] Clean(string[] values)
         => values.Select(v => (v ?? "").Trim())
                  .Where(v => v.Length > 0)
@@ -182,6 +218,9 @@ public sealed class SettingsService : IDisposable
            && a.RemoteAccessEnabled == b.RemoteAccessEnabled
            && a.AdminHttpsPort == b.AdminHttpsPort
            && string.Equals(a.CertificatePath, b.CertificatePath, StringComparison.Ordinal)
+           && string.Equals(a.DeviceTimeZone, b.DeviceTimeZone, StringComparison.Ordinal)
+           && a.DeviceTimeZones.Count == b.DeviceTimeZones.Count
+           && a.DeviceTimeZones.All(kv => b.DeviceTimeZones.TryGetValue(kv.Key, out var v) && string.Equals(kv.Value, v, StringComparison.Ordinal))
            && a.AllowedIps.SequenceEqual(b.AllowedIps, StringComparer.OrdinalIgnoreCase)
            && a.DeviceAllowedIps.SequenceEqual(b.DeviceAllowedIps, StringComparer.OrdinalIgnoreCase);
 
@@ -209,6 +248,9 @@ public sealed class SettingsService : IDisposable
                     s.AllowedIps = Clean(parsed.AllowedIps ?? Array.Empty<string>());
                     s.DeviceAllowedIps = Clean(parsed.DeviceAllowedIps ?? Array.Empty<string>());
                     s.CertificatePath = (parsed.CertificatePath ?? "").Trim();
+                    if (DeviceClock.TryResolve(parsed.DeviceTimeZone, out _, out var deviceZone))
+                        s.DeviceTimeZone = deviceZone;
+                    s.DeviceTimeZones = CleanZones(parsed.DeviceTimeZones ?? new Dictionary<string, string>());
                 }
             }
         }

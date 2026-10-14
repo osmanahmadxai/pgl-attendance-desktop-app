@@ -34,12 +34,20 @@ public sealed class HrmisClient
     /// </summary>
     public sealed record Result(bool Ok, string ResponseText, string? Error, bool IsTransient, bool HasResponse);
 
-    public async Task<Result> PostAsync(string hrmisUrl, string rawData, CancellationToken ct = default)
+    /// <summary>
+    /// Posts one punch. The body is the device's record, byte for byte. Which
+    /// terminal sent it and the clock that terminal was set to travel as URL
+    /// query parameters (<c>SN</c>, <c>tz</c>) so HRMIS can read the wall-clock
+    /// time on the right clock without the record itself being touched.
+    /// </summary>
+    public async Task<Result> PostAsync(
+        string hrmisUrl, string rawData, string? deviceSerial = null, string? deviceTimeZone = null,
+        CancellationToken ct = default)
     {
         try
         {
             var baseUrl = (hrmisUrl ?? "").TrimEnd('/');
-            var fullUrl = baseUrl + "/iclock/cdata";
+            var fullUrl = baseUrl + "/iclock/cdata" + ContextQuery(deviceSerial, deviceTimeZone);
             using var content = new StringContent(rawData, Encoding.UTF8);
             content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("text/plain");
             using var resp = await _http.PostAsync(fullUrl, content, ct);
@@ -58,5 +66,16 @@ public sealed class HrmisClient
         {
             return new Result(false, "", ex.Message, true, false);
         }
+    }
+
+    /// <summary><c>?SN=…&amp;tz=…</c> for whichever of the two is known; empty when neither is.</summary>
+    public static string ContextQuery(string? deviceSerial, string? deviceTimeZone)
+    {
+        var parts = new System.Collections.Generic.List<string>();
+        if (!string.IsNullOrWhiteSpace(deviceSerial))
+            parts.Add("SN=" + Uri.EscapeDataString(deviceSerial.Trim()));
+        if (!string.IsNullOrWhiteSpace(deviceTimeZone))
+            parts.Add("tz=" + Uri.EscapeDataString(deviceTimeZone.Trim()));
+        return parts.Count == 0 ? "" : "?" + string.Join("&", parts);
     }
 }
